@@ -75,8 +75,6 @@ python main.py predict   dataset/NCM811_ISC_TEST/DST/ISC_CS_0.5CC_DST_10ohm.csv
 
 ## Key design decisions (per spec)
 
-- **PSO removed.** The `optimization/` package from Battery_Passport is
-  not ported. Only the NN-based parameter estimation path is kept.
 - **Parameter bounds removed.** All `np.clip()` calls on C1, C2, R0, R1, R2,
   gamma1, M0, M inside `BatteryModel.calculate_voltage` are gone. The SOC
   `np.clip(z, 0, 100)` and the epsilon safety factor are kept.

@@ -15,17 +15,26 @@ from scipy.interpolate import interp1d
 class BatteryModel:
     """Electrochemical battery model for voltage calculation."""
 
-    def __init__(self, sampling_time: float = 1.0, capacity_as: float = 10 * 3600):
+    def __init__(self, sampling_time: float = 1.0, capacity_as: float = 10 * 3600,
+                 ocv_soc=None, ocv_voltage=None):
         self.Ts = float(sampling_time)
         self.Q = float(capacity_as)
-        self.setup_ocv_curve()
+        self.setup_ocv_curve(ocv_soc, ocv_voltage)
 
-    def setup_ocv_curve(self):
-        self.ocv_y = np.array([2.5, 2.5999, 2.757, 3.0026, 3.1401, 3.2088, 3.2383,
-                               3.2726, 3.2972, 3.3119, 3.3119, 3.3365, 3.3709, 3.4887, 3.5])
-        self.ocv_x = np.array([0, 0.18474, 0.71411, 3.5374, 7.243, 12.36, 20.124,
-                               32.3, 44.828, 60.0004, 70.591, 84.708, 97.413, 99.707, 100])
-        self.ocv_interp = interp1d(self.ocv_x, self.ocv_y, kind='linear', fill_value="extrapolate")
+    def setup_ocv_curve(self, ocv_soc=None, ocv_voltage=None):
+        # Default falls back to the legacy LFP-like curve from upstream
+        # Battery_Passport. The Tsinghua loader / trainer pass the NCM811
+        # curve from src.config.BATTERY_CONFIG["ocv_curve"] so V_pred can
+        # actually reach the ~4.2 V peak of the measured data.
+        if ocv_soc is None or ocv_voltage is None:
+            ocv_soc = [0, 0.18474, 0.71411, 3.5374, 7.243, 12.36, 20.124,
+                       32.3, 44.828, 60.0004, 70.591, 84.708, 97.413, 99.707, 100]
+            ocv_voltage = [2.5, 2.5999, 2.757, 3.0026, 3.1401, 3.2088, 3.2383,
+                           3.2726, 3.2972, 3.3119, 3.3119, 3.3365, 3.3709, 3.4887, 3.5]
+        self.ocv_x = np.asarray(ocv_soc, dtype=np.float64)
+        self.ocv_y = np.asarray(ocv_voltage, dtype=np.float64)
+        self.ocv_interp = interp1d(self.ocv_x, self.ocv_y, kind='linear',
+                                   fill_value="extrapolate")
 
     def calculate_ocv(self, soc):
         soc = np.clip(soc, 0, 100)

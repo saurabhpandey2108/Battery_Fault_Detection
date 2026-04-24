@@ -42,11 +42,15 @@ BATTERY_CONFIG = {
         "efficiency": 1,
         "initial_soc": 100,
     },
+    # NCM811 open-circuit voltage curve at 25 C, spanning 2.8 V at 0% SOC
+    # to 4.2 V at 100% SOC (matches the Tsinghua dataset we actually have).
+    # The upstream Battery_Passport curve peaked at 3.5 V, which is LFP-like
+    # chemistry and structurally capped V_pred far below V_meas for NCM811.
     "ocv_curve": {
-        "soc_points": [0, 0.18474, 0.71411, 3.5374, 7.243, 12.36, 20.124,
-                       32.3, 44.828, 60.0004, 70.591, 84.708, 97.413, 99.707, 100],
-        "voltage_points": [2.5, 2.5999, 2.757, 3.0026, 3.1401, 3.2088, 3.2383,
-                           3.2726, 3.2972, 3.3119, 3.3119, 3.3365, 3.3709, 3.4887, 3.5],
+        "soc_points":     [0.0, 5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0,
+                           70.0, 80.0, 90.0, 95.0, 100.0],
+        "voltage_points": [2.80, 3.30, 3.45, 3.55, 3.60, 3.63, 3.68, 3.78,
+                           3.90, 4.00, 4.10, 4.15, 4.20],
     },
 }
 

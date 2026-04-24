@@ -17,6 +17,8 @@ models/*.keras
 results/three_scalograms/*.png
 results/plots/*.png
 results/*.log
+results/pinn_inference_dump.csv
+results/pinn_inference_dump.xlsx
 dataset/
 
 # Keep first-result deliverable PNG tracked

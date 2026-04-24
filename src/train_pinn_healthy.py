@@ -1,143 +1,416 @@
 """
 Train the PINN on healthy (BD) Tsinghua discharge data only.
 
-This mirrors Battery_Passport/train.py with two removals per spec:
-    * No PSO (optimization/ package is not ported).
-    * No parameter bounds on the 8 electrochemical outputs.
+Rewrite (v2) — motivated by three issues found in the original pipeline:
 
-Phase 1: trains on the 14 BD files at charge_rate=0.5, discharge_mode=DST.
-The trained NumPy weights are saved to models/pinn_healthy.npz so that
-infer_pinn.predict_voltage_series can freeze them for downstream stages.
+  1. The upstream training consumed 14 engineered features whose
+     Current_sense / Terminal_voltage positions disagreed with what
+     `_calculate_voltages` expected at the physics call site. The NN has
+     been learning to map voltage-as-current for a long time. Input is
+     now exactly (V_meas, I_meas).
+
+  2. Upstream backprop propagated the SAME voltage error to all 8 output
+     neurons, which isn't the derivative of V with respect to any of
+     them. Here we use the true Jacobian dV/dp_k computed by finite
+     differences on `BatteryModel.calculate_voltage` at each step. Every
+     parameter gets its own descent direction.
+
+  3. Training was per-sample-stateless but inference is state-threaded.
+     The two criteria optimize different things. Here training uses the
+     same threaded rollout that inference does: for each BD file we roll
+     out the full discharge with (ir1, ir2, z, h, s) threaded across
+     timesteps, compute file-level RMSE against V_meas, and update once
+     per file per epoch.
+
+Safety measures (NOT parameter bounds):
+
+  * Gradient-norm clipping (inside the optimizer).
+  * NaN/inf batch skip: if forward or gradient contains non-finite
+    values, the update is abandoned for that file.
+  * Numerical state reset inside the rollout when |V| > 10 V or state is
+    non-finite, mirroring the inference path.
+
+Logging:
+
+  * results/train_pinn_v2_history.csv — per-epoch train/val RMSE,
+    param-level means.
+  * results/pinn_inference_dump.csv   — per-sample (time, V_meas, V_pred,
+    C1, C2, R0, R1, R2, gamma1, M0, M) for every BD file, produced once
+    at the end of training with the final best weights.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import sys
+import time
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
 
-# Make package imports work regardless of cwd when invoked as a script.
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from src.config import (
-    DATASET_DIR, MODELS_DIR, NN_CONFIG, DATA_CONFIG, BATTERY_CONFIG,
+    DATASET_DIR, MODELS_DIR, RESULTS_DIR, BATTERY_CONFIG,
     PHASE1_CHARGE_RATE, PHASE1_DISCHARGE_MODE,
 )
 from src.data.tsinghua_loader import load_tsinghua_csv, list_phase1_files
-from src.data.prepare_pinn_features import (
-    engineer_pinn_features, to_training_dataset,
-)
-from src.pinn.data_loader import BatteryDataProcessor
-from src.pinn.deep_neural_network import DeepNeuralNetwork
+from src.pinn.battery_physics import BatteryModel
+from src.pinn.pinn_v2 import PinnV2
 
 
-def build_healthy_dataset(root: str,
-                          charge_rate: float,
-                          discharge_mode: str,
-                          window_size: int,
-                          verbose: bool = True) -> np.ndarray:
-    """Assemble one big (N, 15) array by concatenating engineered features
-    from every BD discharge file in the Phase 1 subset."""
-    processor = BatteryDataProcessor(window_size=window_size)
-    files = list_phase1_files(root, charge_rate=charge_rate,
+# Hyperparameter defaults — small, simple, stable.
+DEFAULT_ARCH = (2, 32, 32, 8)
+DEFAULT_LR = 3e-4
+DEFAULT_EPOCHS = 30
+DEFAULT_PATIENCE = 6
+DEFAULT_CLIPNORM = 1.0
+DEFAULT_TVALID_WINDOW = 8        # moving-average window for val RMSE
+FINITE_DIFF_EPS_ABS = 1e-6       # fallback when |param| ~ 0
+
+
+# ----------------------------------------------------------------------
+#  Data loading — (V, I) pairs per file
+# ----------------------------------------------------------------------
+def load_vi_series(filepath: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (time, V, I) for one Tsinghua discharge file. 1 Hz."""
+    d = load_tsinghua_csv(filepath)
+    df = d["discharge_df"]
+    t = df["time_s"].to_numpy(dtype=np.float64)
+    v = df["voltage_V"].to_numpy(dtype=np.float64)
+    i = df["current_A"].to_numpy(dtype=np.float64)
+    return t, v, i
+
+
+def load_all_bd_files(root: str, charge_rate: float, discharge_mode: str) -> List[dict]:
+    paths = list_phase1_files(root, charge_rate=charge_rate,
                               discharge_mode=discharge_mode, class_="BD")
-    if not files:
+    if not paths:
         raise RuntimeError(
             f"No BD files found under {root} for {charge_rate}C / {discharge_mode}"
         )
-
-    parts = []
-    for fp in files:
-        d = load_tsinghua_csv(fp)
-        eng = engineer_pinn_features(d["discharge_df"], processor, window_size=window_size)
-        arr = to_training_dataset(eng)
-        parts.append(arr)
-        if verbose:
-            print(f"  {os.path.basename(fp)} -> {arr.shape}")
-    dataset = np.vstack(parts)
-    if verbose:
-        print(f"Total training array: {dataset.shape}")
-    return dataset
+    files = []
+    for fp in paths:
+        t, v, i = load_vi_series(fp)
+        files.append({
+            "path": fp,
+            "name": os.path.basename(fp),
+            "time": t, "v": v, "i": i,
+            "X": np.stack([v, i], axis=1).astype(np.float64),
+        })
+        print(f"  loaded {files[-1]['name']:<40s} -> N={len(t)}")
+    return files
 
 
+# ----------------------------------------------------------------------
+#  Forward rollout with threaded state + finite-diff Jacobians
+# ----------------------------------------------------------------------
+def rollout(model: BatteryModel,
+            params_seq: np.ndarray,
+            current_seq: np.ndarray,
+            v_meas: np.ndarray,
+            initial_soc: float,
+            compute_jacobian: bool = False
+            ) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Roll out the physics across a full discharge series.
+
+    Parameters
+    ----------
+    params_seq : (N, 8) predicted parameters per timestep.
+    current_seq : (N,) measured current per timestep.
+    v_meas : (N,) measured voltage (only used for the state-reset fallback).
+    compute_jacobian : if True, also return dV_t/dparam_t for every t
+                       via finite differences.
+
+    Returns
+    -------
+    v_pred : (N,) predicted voltage.
+    jacobian : (N, 8) or None.
+    n_state_resets : int  (numerical safety events).
+    """
+    N = len(current_seq)
+    v_pred = np.zeros(N, dtype=np.float64)
+    jac = np.zeros((N, 8), dtype=np.float64) if compute_jacobian else None
+
+    ir1, ir2, h, s = 0.0, 0.0, 0.0, 0.0
+    z = float(initial_soc)
+    n_resets = 0
+
+    for t in range(N):
+        p = params_seq[t]
+        i = current_seq[t]
+
+        v, ir1_n, ir2_n, z_n, h_n, s_n = model.calculate_voltage(
+            p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], i,
+            ir1=ir1, ir2=ir2, z=z, h=h, s=s,
+        )
+
+        # Numerical safety: reset state if rollout diverges (NOT a parameter bound).
+        if (not np.isfinite(v)) or (not np.isfinite(ir1_n)) or \
+           (not np.isfinite(ir2_n)) or abs(v) > 10.0:
+            v = float(v_meas[t])
+            ir1_n, ir2_n = 0.0, 0.0
+            n_resets += 1
+
+        v_pred[t] = v
+
+        if compute_jacobian:
+            # Local Jacobian dV(t)/dp_k(t) via central finite differences.
+            # State is held at pre-step values (ir1, ir2, z, h, s) so the
+            # perturbation only probes the immediate param-to-voltage map.
+            for k in range(8):
+                step = FINITE_DIFF_EPS_ABS + 1e-4 * abs(p[k])
+                p_plus = p.copy(); p_plus[k] += step
+                p_minus = p.copy(); p_minus[k] -= step
+                v_plus, *_ = model.calculate_voltage(
+                    p_plus[0], p_plus[1], p_plus[2], p_plus[3],
+                    p_plus[4], p_plus[5], p_plus[6], p_plus[7], i,
+                    ir1=ir1, ir2=ir2, z=z, h=h, s=s,
+                )
+                v_minus, *_ = model.calculate_voltage(
+                    p_minus[0], p_minus[1], p_minus[2], p_minus[3],
+                    p_minus[4], p_minus[5], p_minus[6], p_minus[7], i,
+                    ir1=ir1, ir2=ir2, z=z, h=h, s=s,
+                )
+                if np.isfinite(v_plus) and np.isfinite(v_minus):
+                    jac[t, k] = (v_plus - v_minus) / (2.0 * step)
+                else:
+                    jac[t, k] = 0.0  # perturbation itself unstable -> no signal
+
+        # Advance state after the jacobian is computed.
+        ir1, ir2, z, h, s = ir1_n, ir2_n, z_n, h_n, s_n
+
+    return v_pred, jac, n_resets
+
+
+# ----------------------------------------------------------------------
+#  Training loop
+# ----------------------------------------------------------------------
+def file_level_train(nn: PinnV2,
+                     model: BatteryModel,
+                     file_: dict,
+                     lr: float,
+                     clipnorm: float,
+                     compute_update: bool = True
+                     ) -> Tuple[float, np.ndarray, int]:
+    """One file -> one forward rollout -> one optimizer step (if training)."""
+    params_seq = nn.forward(file_["X"], training=compute_update)   # (N, 8)
+    v_pred, jac, n_resets = rollout(
+        model, params_seq, file_["i"], file_["v"],
+        initial_soc=BATTERY_CONFIG["constants"]["initial_soc"],
+        compute_jacobian=compute_update,
+    )
+
+    err = v_pred - file_["v"]
+    if not np.all(np.isfinite(err)):
+        return float("nan"), params_seq, n_resets
+    rmse = float(np.sqrt(np.mean(err ** 2)))
+
+    if compute_update:
+        if not np.all(np.isfinite(jac)):
+            return rmse, params_seq, n_resets
+        N = len(err)
+        # d(MSE)/d(params_t) = 2/N * err_t * dV_t/dparam_t
+        d_out = (2.0 / N) * err[:, None] * jac                     # (N, 8)
+        nn.backward(d_out)
+        nn.optimize(lr=lr, clipnorm=clipnorm)
+
+    return rmse, params_seq, n_resets
+
+
+def evaluate(nn: PinnV2, model: BatteryModel, files: List[dict]) -> float:
+    rmses = []
+    for f in files:
+        r, _, _ = file_level_train(nn, model, f, lr=0.0, clipnorm=0.0,
+                                   compute_update=False)
+        if np.isfinite(r):
+            rmses.append(r)
+    if not rmses:
+        return float("inf")
+    return float(np.mean(rmses))
+
+
+# ----------------------------------------------------------------------
+#  Post-training per-sample dump
+# ----------------------------------------------------------------------
+def dump_inference_csv(nn: PinnV2, model: BatteryModel,
+                       files: List[dict], out_path: str):
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    cols = ["file", "time_s", "current_A", "V_meas", "V_pred",
+            "C1", "C2", "R0", "R1", "R2", "gamma1", "M0", "M"]
+    rows = []
+    for f in files:
+        params_seq = nn.forward(f["X"], training=False)
+        v_pred, _, _ = rollout(
+            model, params_seq, f["i"], f["v"],
+            initial_soc=BATTERY_CONFIG["constants"]["initial_soc"],
+            compute_jacobian=False,
+        )
+        for t in range(len(f["v"])):
+            rows.append([
+                f["name"], float(f["time"][t]), float(f["i"][t]),
+                float(f["v"][t]), float(v_pred[t]),
+                *[float(p) for p in params_seq[t]],
+            ])
+    with open(out_path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(cols)
+        w.writerows(rows)
+    print(f"[train_pinn_healthy] per-sample dump saved -> {out_path}  ({len(rows)} rows)")
+
+
+# ----------------------------------------------------------------------
+#  CLI entry
+# ----------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Train healthy-only PINN on Tsinghua DST data")
+    parser = argparse.ArgumentParser(description="Train v2 PINN on Tsinghua BD DST data")
     parser.add_argument("--dataset-root", default=DATASET_DIR)
     parser.add_argument("--charge-rate", type=float, default=PHASE1_CHARGE_RATE)
     parser.add_argument("--discharge-mode", default=PHASE1_DISCHARGE_MODE)
-    parser.add_argument("--output", default=os.path.join(MODELS_DIR, "pinn_healthy.npz"))
-    parser.add_argument("--epochs", type=int, default=NN_CONFIG["training"]["epochs"])
-    parser.add_argument("--batch-size", type=int, default=NN_CONFIG["training"]["batch_size"])
-    parser.add_argument("--learning-rate", type=float, default=NN_CONFIG["training"]["learning_rate"])
-    parser.add_argument("--patience", type=int, default=NN_CONFIG["training"]["early_stopping_patience"])
-    parser.add_argument("--seed", type=int, default=DATA_CONFIG["random_seed"])
+    parser.add_argument("--output",
+                        default=os.path.join(MODELS_DIR, "pinn_healthy.npz"))
+    parser.add_argument("--history-csv",
+                        default=os.path.join(RESULTS_DIR, "train_pinn_v2_history.csv"))
+    parser.add_argument("--dump-csv",
+                        default=os.path.join(RESULTS_DIR, "pinn_inference_dump.csv"))
+    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    parser.add_argument("--patience", type=int, default=DEFAULT_PATIENCE,
+                        help="Early-stop patience measured on the MOVING AVERAGE "
+                             "of val RMSE, ignoring spike epochs.")
+    parser.add_argument("--learning-rate", type=float, default=DEFAULT_LR)
+    parser.add_argument("--clipnorm", type=float, default=DEFAULT_CLIPNORM)
+    parser.add_argument("--val-fraction", type=float, default=0.2,
+                        help="Fraction of BD files held out for validation.")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--skip-dump", action="store_true",
+                        help="Skip the final per-sample CSV dump")
+    # The flags below are accepted for backward compatibility with the old
+    # CLI; they are ignored because v2 trains per-file, not per-batch.
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="(ignored — v2 is file-level)")
     args = parser.parse_args()
+    if args.batch_size is not None:
+        print("[train_pinn_healthy] note: --batch-size is ignored in v2 (file-level training)")
 
     np.random.seed(args.seed)
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    os.makedirs(os.path.dirname(args.history_csv), exist_ok=True)
 
-    print(f"[train_pinn_healthy] Phase 1 subset: {args.charge_rate}C / {args.discharge_mode}, BD only")
-    dataset = build_healthy_dataset(
-        root=args.dataset_root,
-        charge_rate=args.charge_rate,
-        discharge_mode=args.discharge_mode,
-        window_size=DATA_CONFIG["window_size"],
+    # -------- data --------
+    print(f"[train_pinn_healthy] Phase 1 subset: {args.charge_rate}C / "
+          f"{args.discharge_mode}, BD only (V, I only as NN input)")
+    files_all = load_all_bd_files(args.dataset_root, args.charge_rate,
+                                  args.discharge_mode)
+    n_val = max(1, int(round(args.val_fraction * len(files_all))))
+    rng = np.random.default_rng(args.seed)
+    perm = rng.permutation(len(files_all))
+    val_files = [files_all[i] for i in perm[:n_val]]
+    train_files = [files_all[i] for i in perm[n_val:]]
+    print(f"[train_pinn_healthy] files -> train {len(train_files)}  val {len(val_files)}")
+
+    # -------- model --------
+    sampling_time = BATTERY_CONFIG["constants"]["sampling_time"]
+    capacity_as = BATTERY_CONFIG["constants"]["capacity"]
+    ocv = BATTERY_CONFIG["ocv_curve"]
+    model = BatteryModel(
+        sampling_time=sampling_time,
+        capacity_as=capacity_as,
+        ocv_soc=ocv["soc_points"],
+        ocv_voltage=ocv["voltage_points"],
     )
 
-    arch = NN_CONFIG["architecture"]
-    sizes = [arch["input_size"]] + arch["hidden_layers"] + [arch["output_size"]]
-    print(f"[train_pinn_healthy] Architecture: {sizes}")
-
-    nn = DeepNeuralNetwork(
-        sizes=sizes,
-        activation=arch["activation"],
-        dropout_rate=arch["dropout_rate"],
-    )
-
-    # Warm-start the 8 output units to the config's target physical values.
-    # This is an *initial condition* — not a bound. The output layer is still
-    # linear and every parameter remains free to drift anywhere during Adam
-    # optimization. The purpose is purely numerical: at He-initialized He
-    # scale, the random outputs put tau1 = R1*C1 into regions where
-    # np.exp(-Ts/tau) overflows and poisons the RMSE with NaN before the
-    # optimizer can take any useful step. Starting from physically plausible
-    # values keeps the first forward pass finite so training can begin.
+    nn = PinnV2(layer_sizes=DEFAULT_ARCH, dropout_rate=0.0, seed=args.seed)
     tv = np.array(list(BATTERY_CONFIG["target_values"].values()), dtype=np.float64)
-    out_idx = len(sizes) - 1
-    nn.params[f"W{out_idx}"] = nn.params[f"W{out_idx}"] * 1e-3
-    nn.params[f"b{out_idx}"] = tv.reshape(-1, 1)
-    nn.adam_opt["m"][f"W{out_idx}"] = np.zeros_like(nn.params[f"W{out_idx}"])
-    nn.adam_opt["v"][f"W{out_idx}"] = np.zeros_like(nn.params[f"W{out_idx}"])
-    nn.adam_opt["m"][f"b{out_idx}"] = np.zeros_like(nn.params[f"b{out_idx}"])
-    nn.adam_opt["v"][f"b{out_idx}"] = np.zeros_like(nn.params[f"b{out_idx}"])
-    print(f"[train_pinn_healthy] warm-started output-layer biases to target_values")
+    nn.warm_start_output_bias(tv)
+    print(f"[train_pinn_healthy] architecture: {DEFAULT_ARCH}, "
+          f"warm-start biases = target_values")
 
-    history = nn.train(
-        dataset=dataset,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        l_rate=args.learning_rate,
-        validation_split=NN_CONFIG["training"]["validation_split"],
-        early_stopping_patience=args.patience,
-    )
+    # -------- history csv header --------
+    hist_cols = ["epoch", "train_rmse", "val_rmse", "val_rmse_movavg",
+                 "n_state_resets",
+                 "C1_mean", "C2_mean", "R0_mean", "R1_mean",
+                 "R2_mean", "gamma1_mean", "M0_mean", "M_mean",
+                 "time_s"]
+    with open(args.history_csv, "w", newline="") as fh:
+        csv.writer(fh).writerow(hist_cols)
 
-    # The upstream DNN.train only restores best_params when early stopping
-    # fires. If the full epoch budget is used, self.params ends at the final
-    # epoch — which can be one of the numerically unstable epochs. Force a
-    # restore from best_params before saving so the frozen PINN reflects the
-    # best validation checkpoint observed during training.
-    if hasattr(nn, "best_params") and np.isfinite(history.get("best_val_loss", np.inf)):
-        nn.params = {k: v.copy() for k, v in nn.best_params.items()}
-        print("[train_pinn_healthy] restored best-val weights before saving")
+    # -------- training loop --------
+    best_val = float("inf")
+    best_val_movavg = float("inf")
+    best_params = None
+    patience_counter = 0
+    val_history: List[float] = []
 
-    nn.save_model(args.output)
-    print(f"[train_pinn_healthy] best val RMSE = {history['best_val_loss']:.6f}")
-    print(f"[train_pinn_healthy] weights saved -> {args.output}")
+    for epoch in range(1, args.epochs + 1):
+        t0 = time.time()
+        rng.shuffle(train_files)
+
+        train_rmses, resets_epoch = [], 0
+        for f in train_files:
+            rmse, params_seq, n_resets = file_level_train(
+                nn, model, f, lr=args.learning_rate, clipnorm=args.clipnorm,
+                compute_update=True,
+            )
+            resets_epoch += n_resets
+            if np.isfinite(rmse):
+                train_rmses.append(rmse)
+
+        train_rmse = float(np.mean(train_rmses)) if train_rmses else float("nan")
+        val_rmse = evaluate(nn, model, val_files)
+        val_history.append(val_rmse)
+
+        # Moving-average val RMSE — more meaningful than any single epoch
+        # when individual epochs can spike. Patience measures stagnation
+        # of this smoothed signal.
+        window = val_history[-DEFAULT_TVALID_WINDOW:]
+        finite_window = [x for x in window if np.isfinite(x)]
+        val_movavg = float(np.mean(finite_window)) if finite_window else float("inf")
+
+        # Mean of final-epoch predicted parameters across training samples.
+        last_params = nn.forward(train_files[0]["X"], training=False)  # (N, 8)
+        pm = last_params.mean(axis=0)
+
+        epoch_time = time.time() - t0
+        print(f"Epoch {epoch:02d}/{args.epochs} - {epoch_time:.1f}s - "
+              f"train RMSE {train_rmse:.4f}  val RMSE {val_rmse:.4f}  "
+              f"val-MA {val_movavg:.4f}  resets {resets_epoch}")
+
+        with open(args.history_csv, "a", newline="") as fh:
+            csv.writer(fh).writerow([
+                epoch, train_rmse, val_rmse, val_movavg, resets_epoch,
+                *[float(x) for x in pm], epoch_time,
+            ])
+
+        # Track best by moving average (robust to spikes).
+        if np.isfinite(val_movavg) and val_movavg < best_val_movavg - 1e-6:
+            best_val_movavg = val_movavg
+            best_val = val_rmse
+            best_params = {k: v.copy() for k, v in nn.params.items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        if patience_counter >= args.patience:
+            print(f"[train_pinn_healthy] early stopping — moving-avg val RMSE "
+                  f"has not improved in {args.patience} epochs "
+                  f"(best MA {best_val_movavg:.4f} at spot val {best_val:.4f})")
+            break
+
+    # Restore best weights before saving.
+    if best_params is not None:
+        nn.params = best_params
+        print(f"[train_pinn_healthy] restored best-MA weights "
+              f"(val MA {best_val_movavg:.4f}, val spot {best_val:.4f})")
+
+    nn.save(args.output)
+
+    if not args.skip_dump:
+        dump_inference_csv(nn, model, files_all, args.dump_csv)
 
 
 if __name__ == "__main__":
