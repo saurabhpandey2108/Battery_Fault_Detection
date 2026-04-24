@@ -1,0 +1,13 @@
+numpy 
+pandas
+matplotlib
+scipy
+tensorflow
+scikit-learn
+opencv-python
+openpyxl
+pypdf
+jupyter
+ipykernel
+seaborn
+tqdm

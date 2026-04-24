@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Project artifacts
+_sources/
+cache/
+models/*.npz
+models/*.keras
+results/three_scalograms/*.png
+results/plots/*.png
+results/*.log
+dataset/
+
+# Keep first-result deliverable PNG tracked
+!results/three_scalograms/bd_vs_cs_10ohm.png
+
