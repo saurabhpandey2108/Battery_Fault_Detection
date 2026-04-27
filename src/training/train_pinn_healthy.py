@@ -106,15 +106,31 @@ def rollout(model: BatteryModel,
             params_seq: np.ndarray,
             current_seq: np.ndarray,
             v_meas: np.ndarray,
-            initial_soc: float,
-            compute_jacobian: bool = False
-            ) -> Tuple[np.ndarray, np.ndarray, int]:
+            initial_soc: float = None,
+            compute_jacobian: bool = False,
+            init_state: dict = None,
+            ) -> Tuple[np.ndarray, np.ndarray, int, dict]:
+    """Threaded-state physics rollout.
+
+    Returns (v_pred, jac, n_resets, final_state). If `init_state` is
+    given (a dict with ir1, ir2, z, h, s) the rollout starts from that
+    state -- this is how window k's final state seeds window k+1's
+    initial state, threading state across an entire file even when
+    Adam updates are taken per window.
+    """
     N = len(current_seq)
     v_pred = np.zeros(N, dtype=np.float64)
     jac = np.zeros((N, 8), dtype=np.float64) if compute_jacobian else None
 
-    ir1, ir2, h, s = 0.0, 0.0, 0.0, 0.0
-    z = float(initial_soc)
+    if init_state is not None:
+        ir1 = float(init_state["ir1"])
+        ir2 = float(init_state["ir2"])
+        z = float(init_state["z"])
+        h = float(init_state["h"])
+        s = float(init_state["s"])
+    else:
+        ir1, ir2, h, s = 0.0, 0.0, 0.0, 0.0
+        z = float(initial_soc) if initial_soc is not None else 100.0
     n_resets = 0
 
     for t in range(N):
@@ -156,46 +172,95 @@ def rollout(model: BatteryModel,
 
         ir1, ir2, z, h, s = ir1_n, ir2_n, z_n, h_n, s_n
 
-    return v_pred, jac, n_resets
+    final_state = {"ir1": ir1, "ir2": ir2, "z": z, "h": h, "s": s}
+    return v_pred, jac, n_resets, final_state
 
 
 # ----------------------------------------------------------------------
-#  Training step (one file -> one rollout -> one Adam update)
+#  Window-level training (Path B)
 # ----------------------------------------------------------------------
+DEFAULT_TRAIN_WINDOW = 256        # samples per gradient update (~0.7 DST cycles)
+DEFAULT_TRAIN_STRIDE = 256        # non-overlapping by default
+
+
 def file_level_train(nn: PinnV2,
                      model: BatteryModel,
                      pack: dict,
                      lr: float,
                      clipnorm: float,
+                     window_size: int = DEFAULT_TRAIN_WINDOW,
+                     stride: int = DEFAULT_TRAIN_STRIDE,
                      compute_update: bool = True
                      ) -> Tuple[float, np.ndarray, int]:
-    params_seq = nn.forward(pack["X"], training=compute_update)   # (N, 8)
-    v_pred, jac, n_resets = rollout(
-        model, params_seq, pack["current"], pack["v_meas"],
-        initial_soc=BATTERY_CONFIG["constants"]["initial_soc"],
-        compute_jacobian=compute_update,
-    )
+    """Window-based training pass over one BD file.
 
-    err = v_pred - pack["v_meas"]
-    if not np.all(np.isfinite(err)):
-        return float("nan"), params_seq, n_resets
-    rmse = float(np.sqrt(np.mean(err ** 2)))
+    For each non-overlapping window of size `window_size`:
+      - forward the NN on the window's 35-feature inputs    -> 8 params/timestep
+      - roll out the physics with state THREADED from the previous window
+      - compute window RMSE against V_meas
+      - take ONE Adam step using local-gradient (finite-diff) Jacobians
 
-    if compute_update:
-        if not np.all(np.isfinite(jac)):
-            return rmse, params_seq, n_resets
-        N = len(err)
-        d_out = (2.0 / N) * err[:, None] * jac
-        nn.backward(d_out)
-        nn.optimize(lr=lr, clipnorm=clipnorm)
+    The final state of each window is the initial state of the next, so
+    the physics is continuous across the entire file. Adam fires ~50 times
+    per file per epoch (vs once per file in the old file-level path).
+    """
+    X = pack["X"]
+    I = pack["current"]
+    V = pack["v_meas"]
+    N = len(V)
 
-    return rmse, params_seq, n_resets
+    state = None
+    initial_soc = BATTERY_CONFIG["constants"]["initial_soc"]
+
+    rmses: List[float] = []
+    full_v_pred = np.zeros(N, dtype=np.float64)
+    full_params = np.zeros((N, 8), dtype=np.float64)
+    total_resets = 0
+
+    for start in range(0, N - window_size + 1, stride):
+        end = start + window_size
+        Xw = X[start:end]
+        Iw = I[start:end]
+        Vw = V[start:end]
+
+        params_w = nn.forward(Xw, training=compute_update)             # (W, 8)
+        v_pred_w, jac_w, n_resets, state = rollout(
+            model, params_w, Iw, Vw,
+            initial_soc=initial_soc,
+            compute_jacobian=compute_update,
+            init_state=state,
+        )
+        total_resets += n_resets
+
+        err = v_pred_w - Vw
+        if not np.all(np.isfinite(err)):
+            # Skip a corrupt window but keep state -- the next window may
+            # recover. Don't update.
+            continue
+        rmse_w = float(np.sqrt(np.mean(err ** 2)))
+        rmses.append(rmse_w)
+
+        full_v_pred[start:end] = v_pred_w
+        full_params[start:end] = params_w
+
+        if compute_update:
+            if not np.all(np.isfinite(jac_w)):
+                continue
+            d_out = (2.0 / window_size) * err[:, None] * jac_w
+            nn.backward(d_out)
+            nn.optimize(lr=lr, clipnorm=clipnorm)
+
+    file_rmse = float(np.mean(rmses)) if rmses else float("nan")
+    return file_rmse, full_params, total_resets
 
 
-def evaluate(nn: PinnV2, model: BatteryModel, files: List[dict]) -> float:
+def evaluate(nn: PinnV2, model: BatteryModel, files: List[dict],
+             window_size: int = DEFAULT_TRAIN_WINDOW,
+             stride: int = DEFAULT_TRAIN_STRIDE) -> float:
     rmses = []
     for f in files:
         r, _, _ = file_level_train(nn, model, f, lr=0.0, clipnorm=0.0,
+                                   window_size=window_size, stride=stride,
                                    compute_update=False)
         if np.isfinite(r):
             rmses.append(r)
@@ -215,7 +280,7 @@ def dump_inference_csv(nn: PinnV2, model: BatteryModel,
     rows = []
     for f in files:
         params_seq = nn.forward(f["X"], training=False)
-        v_pred, _, _ = rollout(
+        v_pred, _, _, _ = rollout(
             model, params_seq, f["current"], f["v_meas"],
             initial_soc=BATTERY_CONFIG["constants"]["initial_soc"],
             compute_jacobian=False,
@@ -257,8 +322,12 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--skip-dump", action="store_true",
                         help="Skip the final per-sample CSV dump")
+    parser.add_argument("--window-size", type=int, default=DEFAULT_TRAIN_WINDOW,
+                        help="Samples per gradient update (Path B). Default 256.")
+    parser.add_argument("--stride", type=int, default=DEFAULT_TRAIN_STRIDE,
+                        help="Window stride. Default 256 (non-overlapping).")
     parser.add_argument("--batch-size", type=int, default=None,
-                        help="(ignored — file-level training)")
+                        help="(ignored — window-level training)")
     args = parser.parse_args()
     if args.batch_size is not None:
         print("[train_pinn_healthy] note: --batch-size is ignored (file-level training)")
@@ -274,6 +343,8 @@ def main():
     print(f"[train_pinn_healthy] inputs: I, I_window({PINN_WINDOW_SIZE}), "
           f"I_mean_long, I_rms_long, SOC_coulomb, dI/dt  -> {PINN_FEATURE_COUNT} features")
     print(f"[train_pinn_healthy] inputs DO NOT include voltage of any kind")
+    print(f"[train_pinn_healthy] training: per-window  window={args.window_size}  "
+          f"stride={args.stride}  (state threads file-wide; Adam updates per window)")
 
     files_all = load_all_bd_files(args.dataset_root, args.charge_rate,
                                   args.discharge_mode)
@@ -322,6 +393,7 @@ def main():
         for f in train_files:
             rmse, _, n_resets = file_level_train(
                 nn, model, f, lr=args.learning_rate, clipnorm=args.clipnorm,
+                window_size=args.window_size, stride=args.stride,
                 compute_update=True,
             )
             resets_epoch += n_resets
@@ -329,7 +401,8 @@ def main():
                 train_rmses.append(rmse)
 
         train_rmse = float(np.mean(train_rmses)) if train_rmses else float("nan")
-        val_rmse = evaluate(nn, model, val_files)
+        val_rmse = evaluate(nn, model, val_files,
+                            window_size=args.window_size, stride=args.stride)
         val_history.append(val_rmse)
 
         window = val_history[-DEFAULT_TVALID_WINDOW:]

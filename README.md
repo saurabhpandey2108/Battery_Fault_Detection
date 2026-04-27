@@ -1,4 +1,4 @@
-# Battery Fault Detection — Three-Scalogram Residual Analysis
+# Battery Fault Detection — Scalogram Residual Analysis
 
 Merged pipeline combining two prior projects into a single ISC (internal
 short-circuit) fault detector for the Tsinghua NCM811 dataset:
