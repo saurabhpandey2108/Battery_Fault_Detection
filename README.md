@@ -35,32 +35,54 @@ would be invalidated.
 
 ## Repo layout
 
+Source is grouped by role: configuration, data, models, training, inference,
+visualization, verification, and analysis utilities each live in their own
+sub-package.
+
 ```
 src/
-  config.py                        # merged config (no PSO, no param bounds, Ts=1.0s)
+  config/
+    settings.py                    # all constants (paths, NCM811 OCV, PINN/CWT/CNN config)
+    __init__.py                    #   re-exports settings.* so `from src.config import X` works
+  data/
+    tsinghua_loader.py             # two-block UTF-8-BOM CSV parser + Phase 1 helpers
+    prepare_pinn_features.py       # build_leakage_free_features + coulomb_counted_soc
   pinn/
-    battery_physics.py             # BatteryModel.calculate_voltage (8 params free)
-    deep_neural_network.py         # 14 -> 64x3 -> 8 NumPy DNN
-    data_loader.py                 # BatteryDataProcessor (14 engineered features)
+    battery_physics.py             # BatteryModel.calculate_voltage (8 free params)
+    deep_neural_network.py         # legacy from-scratch DNN (kept untouched for reference)
+    pinn_v2.py                     # active MLP (35 -> 64x3 -> 8) with Adam + grad clipping
+    data_loader.py                 # legacy BatteryDataProcessor (kept for reference)
   wavelet/
     cwt_utils.py                   # Morlet CWT (pure NumPy)
     image_utils.py                 # raw_log_scalogram, normalize_and_resize, stack_channels
     preprocess.py                  # estimate_fs, create_windows, normalize_array
     plot_utils.py                  # plot_frequency_scalogram (supports multi-panel axes)
     model.py                       # build_cnn_model (head="binary"|"multiclass"|"regression")
-  data/
-    tsinghua_loader.py             # two-block UTF-8-BOM CSV parser + Phase 1 helpers
-    prepare_pinn_features.py       # Tsinghua -> BatteryDataProcessor feature schema
-  train_pinn_healthy.py            # fits PINN on BD files only (no PSO, no bounds)
-  infer_pinn.py                    # frozen PINN -> V_pred(t), state threaded per file
-  three_scalogram_builder.py       # build_three_scalogram_image, build_all_windows
-  train_classifier.py              # file-level stratified 70/15/15 split, binary CNN
-  visualize_three_scalograms.py    # 2x2 diagnostic PNG per file
-main.py                            # CLI: list-phase1 / train-pinn / train-cls / visualize / predict
+  scalograms/
+    three_scalogram_builder.py     # build_three_scalogram_image, build_all_windows
+  training/
+    train_pinn_healthy.py          # fits PINN on BD files only (leakage-free inputs)
+    train_classifier.py            # file-level 70/15/15 split, binary CNN
+  inference/
+    infer_pinn.py                  # frozen PINN -> V_pred(t), state threaded per file
+  visualization/
+    visualize_dataset.py           # Task 0 -- 5-panel data inspection + overlay
+    visualize_three_scalograms.py  # 2x2 diagnostic PNG per file
+    compare_bd_cs.py               # BD-vs-CS side-by-side at one resistance
+  verification/
+    verify_residual_signal.py      # acceptance gate before training the classifier
+main.py                            # CLI: list-phase1 / visualize-dataset / verify /
+                                   #      train-pinn / train-classifier / infer /
+                                   #      compare / predict
 dataset/                           # user-supplied Tsinghua data
-models/                            # pinn_healthy.npz, fault_classifier.keras
+models/                            # pinn_healthy_no_leak.npz, fault_classifier.keras
 cache/                             # per-file window caches
-results/                           # plots, three-scalogram figures
+results/                           # all output artifacts
+  dataset_inspection/              #   5-panel PNG per file + comparison overlay
+  three_scalograms/                #   diagnostic figures
+  train_pinn_v2_history.csv        #   per-epoch metrics
+  pinn_inference_dump.csv          #   per-sample (time, V_meas, V_pred, params*8)
+  residual_verification.png        #   verify-stage figure (BD/CS comparison)
 ```
 
 ## Phase 1 run order
@@ -108,3 +130,60 @@ python main.py predict   dataset/NCM811_ISC_TEST/DST/ISC_CS_0.5CC_DST_10ohm.csv
   real cell.
 - The `_sources/` folder (Battery_Passport + Wavelet_Analysis clones) is
   kept as a reference and is ignored by git via `.gitignore`.
+
+## Why the PINN inputs exclude voltage
+
+If `V_meas` is one of the PINN's inputs, the network learns the inverse
+physics map `params = g⁻¹(V_meas, I)` — given any voltage shown to it,
+it produces 8 parameters whose physics rollout reproduces that voltage.
+This is exactly what training pushes it toward, because the loss is
+`||V_pred − V_meas||`. On a CS (faulty) cell, the input `V_meas`
+already carries the ISC signature, so the network outputs params that
+reproduce the faulty voltage and `V_pred ≈ V_meas` — the residual
+collapses to noise on both healthy and faulty cells, and the diagnostic
+disappears. Empirically we observed BD vs CS residual ratios of ~1.05×
+across all 14 resistance pairs with V in the input.
+
+The fix is to give the network only inputs that **cannot** encode the
+fault: instantaneous current, recent and long-window current statistics,
+its first difference, and a coulomb-counted SOC derived from the same
+external current. None of those quantities can reproduce the ISC-induced
+voltage drop, because the ISC current bypasses the ammeter. With this
+input set the only way to reduce loss during training is to genuinely
+learn the I → V mapping of a healthy cell. At inference time on a CS
+cell, the hidden ISC current never reaches the ammeter, the network
+keeps predicting the healthy voltage trajectory, and `V_meas` falls
+below `V_pred` — producing a structured negative-mean residual that is
+the fault detector's input signal.
+
+## SOC handling
+
+The Tsinghua dataset's `SOC|DOD/%` column is **not** a global SOC
+trajectory. The Arbin tester resets it at every step transition of the
+DST profile, so the column reports per-step depth-of-discharge that
+swings between 0 % and 100 % every few seconds. The same applies to the
+`capacity_Ah` column. Verified empirically: 277 single-sample SOC jumps
+of >50 % in one BD file alone, max delta = 100 % in one sample — see
+`results/dataset_inspection/`.
+
+We therefore compute SOC in `src/data/prepare_pinn_features.py` by
+trapezoidal coulomb counting on the external current,
+
+```
+SOC(t) = 1.0 + cumtrapz(I_signed, t_seconds) / (Q_rated × 3600)
+```
+
+with the dataset's sign convention (negative current = discharge) and
+`Q_rated = 2.5487 Ah`, taken as the median net discharged Ah across the
+14 BD DST 0.5C files. The output is clipped to `[0, 1]` to absorb
+numerical overshoot at the endpoints. This is the single coulomb-
+counting site in the codebase. It is fault-blind by construction: the
+ISC current bypasses the ammeter and is therefore not integrated, so
+the SOC estimate stays on the healthy trajectory regardless of the
+cell's internal state — exactly the property that lets the residual
+encode the fault. This matches the methodology used by Shen et al.
+2023 in the original paper that released this dataset.
+
+The dataset's `SOC|DOD/%` and `capacity_Ah` columns are still rendered
+in `visualize-dataset` (the per-step DOD pattern is itself a useful
+sanity check) but they do not enter the model in any way.

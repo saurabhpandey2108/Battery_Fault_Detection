@@ -44,20 +44,30 @@ def _cmd_list_phase1(args):
         print(f"  {ohm:>4} ohm | BD {os.path.basename(bd)} | CS {os.path.basename(cs)}")
 
 
+def _cmd_visualize_dataset(args):
+    from src.visualization import visualize_dataset
+    visualize_dataset.main()
+
+
+def _cmd_verify(args):
+    from src.verification import verify_residual_signal
+    verify_residual_signal.main()
+
+
 def _cmd_train_pinn(passthrough):
-    from src import train_pinn_healthy
+    from src.training import train_pinn_healthy
     sys.argv = ["train_pinn_healthy"] + list(passthrough)
     train_pinn_healthy.main()
 
 
 def _cmd_train_classifier(passthrough):
-    from src import train_classifier
+    from src.training import train_classifier
     sys.argv = ["train_classifier"] + list(passthrough)
     train_classifier.main()
 
 
 def _cmd_infer(args):
-    from src.visualize_three_scalograms import visualize_file
+    from src.visualization.visualize_three_scalograms import visualize_file
 
     visualize_file(
         filepath=args.file,
@@ -70,7 +80,7 @@ def _cmd_infer(args):
 
 
 def _cmd_compare(args):
-    from src.compare_bd_cs import compare_bd_cs
+    from src.visualization.compare_bd_cs import compare_bd_cs
     from src.data.tsinghua_loader import list_phase1_pairs
 
     pairs = list_phase1_pairs(args.dataset_root,
@@ -97,8 +107,8 @@ def _cmd_predict(args):
     import numpy as np
     from src.config import SCALES, WINDOW_SIZE, STRIDE
     from src.data.tsinghua_loader import load_tsinghua_csv
-    from src.infer_pinn import predict_voltage_series
-    from src.three_scalogram_builder import build_all_windows
+    from src.inference.infer_pinn import predict_voltage_series
+    from src.scalograms.three_scalogram_builder import build_all_windows
     from tensorflow import keras
 
     d = load_tsinghua_csv(args.file)
@@ -142,6 +152,15 @@ def build_parser():
     p_list.add_argument("--charge-rate", type=float, default=PHASE1_CHARGE_RATE)
     p_list.add_argument("--discharge-mode", default=PHASE1_DISCHARGE_MODE)
     p_list.set_defaults(func=_cmd_list_phase1)
+
+    p_vd = sub.add_parser("visualize-dataset",
+                          help="Eyeball-check the data BEFORE training (Task 0)")
+    p_vd.set_defaults(func=_cmd_visualize_dataset)
+
+    p_vr = sub.add_parser("verify",
+                          help="Run frozen PINN on BD + CS files, "
+                               "print residual-signal acceptance verdict")
+    p_vr.set_defaults(func=_cmd_verify)
 
     sub.add_parser("train-pinn", help="Train PINN on healthy BD data "
                                       "(all extra args forwarded to src.train_pinn_healthy)")

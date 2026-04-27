@@ -20,13 +20,14 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# File lives at src/visualization/<this>.py -- climb 3 dirnames to reach project root.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from src.config import MODELS_DIR, RESULTS_DIR, SCALES, WINDOW_SIZE
 from src.data.tsinghua_loader import load_tsinghua_csv, parse_filename
-from src.infer_pinn import predict_voltage_series
+from src.inference.infer_pinn import predict_voltage_series
 from src.wavelet.plot_utils import plot_frequency_scalogram
 
 

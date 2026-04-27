@@ -17,7 +17,9 @@ import numpy as np
 # ──────────────────────────────────────────────────────────────────────────────
 #  Project paths
 # ──────────────────────────────────────────────────────────────────────────────
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# This file lives at src/config/settings.py -- climb three dirnames to reach
+# the project root: settings.py -> src/config/ -> src/ -> project root.
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATASET_DIR = os.path.join(PROJECT_ROOT, "dataset")
 MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
 RESULTS_DIR = os.path.join(PROJECT_ROOT, "results")
@@ -110,3 +112,29 @@ CNN_CONFIG = {
 PHASE1_CHARGE_RATE = 0.5
 PHASE1_DISCHARGE_MODE = "DST"
 OHM_VALUES = [10, 20, 30, 50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Coulomb-counted SOC reference capacity
+# ──────────────────────────────────────────────────────────────────────────────
+# Derived as the median net discharged Ah across the 14 BD DST 0.5C files.
+# Each file goes from ~4.18 V down to ~3.05 V (full discharge); the integrated
+# discharge current accumulates 2.42-2.56 Ah depending on file. We use the
+# median as Q_rated so SOC(t) = 1.0 + cumtrapz(I_signed, t_seconds) / (Q_RATED_AH
+# * 3600) lands at ~0 at end-of-discharge for a healthy cell. The dataset's
+# own SOC|DOD/% column is not usable as a global SOC because the Arbin tester
+# resets it at every step transition (verified empirically).
+Q_RATED_AH = 2.5487
+
+
+# Number of recent current samples used as the I_window feature inside
+# build_leakage_free_features. Spec: 30 samples = 30 s of recent current
+# history at the dataset's 1 Hz sampling rate.
+PINN_WINDOW_SIZE = 30
+# Number of samples used for I_mean_long / I_rms_long rolling stats (~5 min).
+PINN_LONG_WINDOW = 300
+# Total feature count = 1 (I) + window_size (I_window) + 1 (I_mean_long)
+#                       + 1 (I_rms_long) + 1 (SOC_coulomb) + 1 (dI/dt)
+PINN_FEATURE_COUNT = 1 + PINN_WINDOW_SIZE + 1 + 1 + 1 + 1   # = 35
+PINN_HIDDEN_LAYERS = (64, 64, 64)
+PINN_OUTPUT_SIZE = 8

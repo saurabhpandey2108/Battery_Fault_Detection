@@ -14,8 +14,8 @@ from typing import Tuple
 
 import numpy as np
 
-from .wavelet.image_utils import raw_log_scalogram, normalize_and_resize
-from .wavelet.preprocess import create_windows
+from src.wavelet.image_utils import raw_log_scalogram, normalize_and_resize
+from src.wavelet.preprocess import create_windows
 
 
 def _channel_image(signal: np.ndarray,

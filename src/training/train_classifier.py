@@ -22,7 +22,8 @@ from typing import List, Tuple
 
 import numpy as np
 
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# File lives at src/training/<this>.py -- climb 3 dirnames to reach project root.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
@@ -32,8 +33,8 @@ from src.config import (
     PHASE1_CHARGE_RATE, PHASE1_DISCHARGE_MODE,
 )
 from src.data.tsinghua_loader import load_tsinghua_csv, list_phase1_pairs
-from src.infer_pinn import load_pinn, predict_voltage_series
-from src.three_scalogram_builder import build_all_windows
+from src.inference.infer_pinn import load_pinn, predict_voltage_series
+from src.scalograms.three_scalogram_builder import build_all_windows
 from src.wavelet.model import build_cnn_model
 from src.pinn.data_loader import BatteryDataProcessor
 

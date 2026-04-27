@@ -24,10 +24,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from .config import SCALES, WINDOW_SIZE, MODELS_DIR, RESULTS_DIR
-from .data.tsinghua_loader import load_tsinghua_csv, parse_filename
-from .infer_pinn import load_pinn, predict_voltage_series
-from .wavelet.image_utils import raw_log_scalogram
+from src.config import SCALES, WINDOW_SIZE, MODELS_DIR, RESULTS_DIR
+from src.data.tsinghua_loader import load_tsinghua_csv, parse_filename
+from src.inference.infer_pinn import load_pinn, predict_voltage_series
+from src.wavelet.image_utils import raw_log_scalogram
 
 
 def _select_window(pred: dict, window_size: int, start: int) -> dict:
