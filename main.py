@@ -4,7 +4,7 @@ Top-level CLI for the merged Battery Fault Detection pipeline.
 Subcommands
 -----------
     list-phase1       List the 14 BD/CS file pairs in the Phase 1 subset.
-    train-pinn        Train the healthy-only PINN (saves models/pinn_healthy.npz).
+    train-pinn        Train the healthy-only PINN (saves models/pinn_healthy_no_leak.npz).
     infer             Render a 2x2 three-scalogram figure for one CSV
                       (uses --file per smoke-test spec).
     compare           Render a 2x4 BD-vs-CS side-by-side figure at one resistance.
@@ -103,6 +103,12 @@ def _cmd_compare(args):
     )
 
 
+def _cmd_scalogram_similarity(args):
+    from src.wavelet.scalogram_metrics import plot_similarity_summary
+    out = plot_similarity_summary(args.csv, args.out)
+    print(f"Saved scalogram-similarity summary -> {out}")
+
+
 def _cmd_predict(args):
     import numpy as np
     from src.config import SCALES, WINDOW_SIZE, STRIDE
@@ -170,7 +176,7 @@ def build_parser():
     # --- infer: render a 2x2 figure for one CSV (smoke-test name) ---
     p_in = sub.add_parser("infer", help="Render a 2x2 three-scalogram figure for one CSV")
     p_in.add_argument("--file", required=True, help="Path to a Tsinghua CSV")
-    p_in.add_argument("--pinn-weights", default=os.path.join(MODELS_DIR, "pinn_healthy.npz"))
+    p_in.add_argument("--pinn-weights", default=os.path.join(MODELS_DIR, "pinn_healthy_no_leak.npz"))
     p_in.add_argument("--out-dir", default=os.path.join(RESULTS_DIR, "three_scalograms"))
     p_in.add_argument("--window-size", type=int, default=WINDOW_SIZE)
     p_in.add_argument("--start-sample", type=int, default=0)
@@ -184,15 +190,23 @@ def build_parser():
     p_cmp.add_argument("--dataset-root", default=DATASET_DIR)
     p_cmp.add_argument("--charge-rate", type=float, default=PHASE1_CHARGE_RATE)
     p_cmp.add_argument("--discharge-mode", default=PHASE1_DISCHARGE_MODE)
-    p_cmp.add_argument("--pinn-weights", default=os.path.join(MODELS_DIR, "pinn_healthy.npz"))
+    p_cmp.add_argument("--pinn-weights", default=os.path.join(MODELS_DIR, "pinn_healthy_no_leak.npz"))
     p_cmp.add_argument("--out-dir", default=os.path.join(RESULTS_DIR, "three_scalograms"))
     p_cmp.add_argument("--window-size", type=int, default=WINDOW_SIZE)
     p_cmp.add_argument("--start-sample", type=int, default=0)
     p_cmp.set_defaults(func=_cmd_compare)
 
+    p_ss = sub.add_parser("scalogram-similarity",
+                          help="Plot scalogram pairwise SSIM/r vs ohm from the similarity CSV")
+    p_ss.add_argument("--csv",
+                      default=os.path.join(RESULTS_DIR, "three_scalograms", "similarity.csv"))
+    p_ss.add_argument("--out",
+                      default=os.path.join(RESULTS_DIR, "three_scalograms", "similarity.png"))
+    p_ss.set_defaults(func=_cmd_scalogram_similarity)
+
     p_pr = sub.add_parser("predict", help="Run the trained classifier on one CSV")
     p_pr.add_argument("--file", required=True)
-    p_pr.add_argument("--pinn-weights", default=os.path.join(MODELS_DIR, "pinn_healthy.npz"))
+    p_pr.add_argument("--pinn-weights", default=os.path.join(MODELS_DIR, "pinn_healthy_no_leak.npz"))
     p_pr.add_argument("--classifier-weights",
                       default=os.path.join(MODELS_DIR, "fault_classifier.keras"))
     p_pr.set_defaults(func=_cmd_predict)

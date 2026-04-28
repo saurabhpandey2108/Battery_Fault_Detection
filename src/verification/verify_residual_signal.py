@@ -276,7 +276,7 @@ def main():
           f"{cs1k['drift_slope_mv_per_soc'] - bd['drift_slope_mv_per_soc']:.1f} mV/unit-SOC "
           f"(mild ISC, not required to pass)")
 
-    out_png = os.path.join(RESULTS_DIR, "residual_verification.png")
+    out_png = os.path.join(RESULTS_DIR, "pinn", "residual_verification.png")
     _verification_figure(rows, out_png)
     print(f"\nFigure saved -> {out_png}")
 

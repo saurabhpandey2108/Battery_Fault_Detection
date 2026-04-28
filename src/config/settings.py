@@ -98,10 +98,13 @@ SCALES = np.geomspace(2.0, 300.0, 96)
 IMAGE_SHAPE = (224, 224, 3)
 
 CNN_CONFIG = {
-    "epochs": 30,
+    "epochs": 60,
     "batch_size": 64,
-    "early_stop_patience": 8,
-    "noise_std": 0.05,
+    "early_stop_patience": 12,   # patience on val_auc (max), see train_classifier.py
+    "noise_std": 0.10,           # bumped: pushes harder against per-window memorization
+    "learning_rate": 1e-4,
+    "l2_lambda": 1e-5,           # mild L2 on conv kernels
+    "dropout_rate": 0.5,         # main dropout after Flatten; second at half this rate
     "random_seed": 42,
 }
 
@@ -138,3 +141,27 @@ PINN_LONG_WINDOW = 300
 PINN_FEATURE_COUNT = 1 + PINN_WINDOW_SIZE + 1 + 1 + 1 + 1   # = 35
 PINN_HIDDEN_LAYERS = (64, 64, 64)
 PINN_OUTPUT_SIZE = 8
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  PINN training hyperparameters
+# ──────────────────────────────────────────────────────────────────────────────
+# Defaults consumed by src/training/train_pinn_healthy.py. CLI flags can
+# override them per-run; this is the single source of truth otherwise.
+PINN_EPOCHS = 100
+PINN_LEARNING_RATE = 1e-4
+PINN_PATIENCE = 12             # early-stop patience on val-RMSE moving average
+PINN_CLIPNORM = 1.0            # global gradient-norm clip (per Adam step)
+PINN_TRAIN_WINDOW = 256        # samples per Adam update (~0.7 DST cycles at 1 Hz)
+PINN_TRAIN_STRIDE = 256        # non-overlapping windows
+PINN_VAL_FRACTION = 0.2
+PINN_VAL_MA_WINDOW = 8         # window for the moving-average val-RMSE
+PINN_FD_EPS_ABS = 1e-6         # finite-difference jacobian step floor
+PINN_RANDOM_SEED = 42
+
+# Soft physics-realism penalty. Biases the network away from numerically
+# pathological parameter combinations (negative R/C, near-zero RC time
+# constants) without hard-clipping the 8 free parameters. Set lambda=0.0
+# to reproduce the unpenalized loss exactly.
+PINN_PHYS_PENALTY_LAMBDA = 0.01
+PINN_PHYS_TAU_MIN = 1e-3       # minimum RC time constant (s) treated as stable

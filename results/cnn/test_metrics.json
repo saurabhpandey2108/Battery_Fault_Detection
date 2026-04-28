@@ -1,0 +1,29 @@
+{
+  "keras_metrics": {
+    "accuracy": 0.5027027130126953,
+    "auc": 0.4320944547653198,
+    "loss": 0.6989949941635132
+  },
+  "window_level": {
+    "tp": 0,
+    "tn": 93,
+    "fp": 0,
+    "fn": 92,
+    "precision": 0.0,
+    "recall": 0.0,
+    "f1": 0.0,
+    "accuracy": 0.5027027027027027
+  },
+  "file_level": {
+    "tp": 0,
+    "tn": 2,
+    "fp": 0,
+    "fn": 2,
+    "precision": 0.0,
+    "recall": 0.0,
+    "f1": 0.0,
+    "accuracy": 0.5
+  },
+  "n_test_windows": 185,
+  "n_test_files": 4
+}

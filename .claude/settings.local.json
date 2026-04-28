@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"from skimage.metrics import structural_similarity; print\\('skimage available, version:', __import__\\('skimage'\\).__version__\\)\")",
+      "Bash(python -c \"from src.training.train_classifier import main, save_training_history; print\\('imports OK'\\)\")",
+      "Bash(.venv/Scripts/python.exe main.py train-classifier)",
+      "Bash(.venv/Scripts/python.exe *)",
+      "Bash(mkdir -p results/cnn results/pinn)",
+      "Bash(git mv *)",
+      "Bash(mv results/cnn_train_history.csv results/cnn/train_history.csv)",
+      "Bash(mv results/cnn_train_history.png results/cnn/train_history.png)",
+      "Bash(mv results/cnn_test_metrics.json results/cnn/test_metrics.json)"
+    ]
+  }
+}

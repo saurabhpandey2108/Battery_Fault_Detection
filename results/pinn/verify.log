@@ -1,0 +1,20 @@
+[PinnV2] weights loaded <- D:\Saurabh Pandey\Battery_Fault_Detection\models\pinn_healthy_no_leak.npz
+[PinnV2] weights loaded <- D:\Saurabh Pandey\Battery_Fault_Detection\models\pinn_healthy_no_leak.npz
+[PinnV2] weights loaded <- D:\Saurabh Pandey\Battery_Fault_Detection\models\pinn_healthy_no_leak.npz
+
+File                     |   RMS (mV)   mean (mV)  smooth mean (mV)   smooth RMS (mV)   drift mV/SOC |   SOC drop coulomb %
+----------------------------------------------------------------------------------------------------------------------------------
+BD 100ohm  (healthy)     |       28.1      -19.64            -19.58             25.30          -6.17 |                97.10
+CS 10ohm   (severe ISC)  |      163.4     -147.40           -147.09            162.42         346.45 |                66.28
+CS 1000ohm (mild ISC)    |       23.8      -12.64            -12.59             20.26          -7.76 |                97.28
+
+Acceptance criteria (drift-aware):
+  [1] CS_10 drift slope - BD drift slope >= 100 mV per unit-SOC:   352.6  ->  True
+  [2] BD smoothed mean - CS_10 smoothed mean >= 10 mV          :  127.50  ->  True
+  [3] CS_10 end SOC - BD end SOC >= 30 percentage points       :   30.82  ->  True
+  [4] All three runs finite                                    :           ->  True
+  reference: CS_1000 drift slope - BD drift slope = -1.6 mV/unit-SOC (mild ISC, not required to pass)
+
+Figure saved -> D:\Saurabh Pandey\Battery_Fault_Detection\results\residual_verification.png
+
+RESIDUAL SIGNAL VERIFIED -- proceed to scalograms.

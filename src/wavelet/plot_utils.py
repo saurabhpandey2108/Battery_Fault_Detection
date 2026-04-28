@@ -17,10 +17,10 @@ from .image_utils import preprocess_window
 from ..config import SCALES
 
 
-def _scalogram_for_display(v_win, fs, scales=None):
+def _scalogram_for_display(v_win, fs, scales=None, detrend: str = "cubic"):
     if scales is None:
         scales = SCALES
-    x = preprocess_window(v_win)
+    x = preprocess_window(v_win, detrend=detrend)
     coeffs, freqs = compute_cwt(x, fs, scales)
     n = len(v_win)
 
@@ -48,13 +48,17 @@ def _scalogram_for_display(v_win, fs, scales=None):
 
 
 def plot_frequency_scalogram(v_win, fs, freqs, save_path, title_suffix="",
-                             ax=None, cmap_name='viridis'):
+                             ax=None, cmap_name='viridis',
+                             detrend: str = "cubic"):
     """2D scalogram — dB magnitude, log-scaled freq axis, COI shaded out.
 
     Can draw onto an existing axis (for multi-panel figures) when `ax` is given;
     otherwise it creates a standalone figure and saves it to `save_path`.
+
+    `detrend` is forwarded to `preprocess_window`. Use "mean" on the residual
+    channel; "cubic" on V_meas / V_pred.
     """
-    scalogram, f, coi_freq = _scalogram_for_display(v_win, fs)
+    scalogram, f, coi_freq = _scalogram_for_display(v_win, fs, detrend=detrend)
 
     valid = scalogram.compressed()
     lo, hi = (np.percentile(valid, 1), np.percentile(valid, 99)) if valid.size else (0, 1)

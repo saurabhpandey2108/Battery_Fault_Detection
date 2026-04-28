@@ -22,9 +22,9 @@ Training contract per epoch:
 Outputs
 -------
   * models/pinn_healthy_no_leak.npz  — frozen NN weights + arch sentinel
-  * results/train_pinn_v2_history.csv — per-epoch metrics
-  * results/pinn_inference_dump.csv   — per-sample inference dump on all
-                                         BD files using the final weights
+  * results/pinn/train_history.csv  — per-epoch metrics
+  * results/pinn/inference_dump.csv — per-sample inference dump on all
+                                       BD files using the final weights
 """
 
 from __future__ import annotations
@@ -49,6 +49,10 @@ from src.config import (
     PHASE1_CHARGE_RATE, PHASE1_DISCHARGE_MODE,
     PINN_FEATURE_COUNT, PINN_HIDDEN_LAYERS, PINN_OUTPUT_SIZE,
     PINN_WINDOW_SIZE, PINN_LONG_WINDOW, Q_RATED_AH,
+    PINN_EPOCHS, PINN_LEARNING_RATE, PINN_PATIENCE, PINN_CLIPNORM,
+    PINN_TRAIN_WINDOW, PINN_TRAIN_STRIDE, PINN_VAL_FRACTION,
+    PINN_VAL_MA_WINDOW, PINN_FD_EPS_ABS, PINN_RANDOM_SEED,
+    PINN_PHYS_PENALTY_LAMBDA, PINN_PHYS_TAU_MIN,
 )
 from src.data.tsinghua_loader import load_tsinghua_csv, list_phase1_files
 from src.data.prepare_pinn_features import build_leakage_free_features
@@ -58,12 +62,6 @@ from src.pinn.pinn_v2 import PinnV2
 
 # Architecture: 35 -> 64 -> 64 -> 64 -> 8 per spec.
 DEFAULT_ARCH = (PINN_FEATURE_COUNT,) + PINN_HIDDEN_LAYERS + (PINN_OUTPUT_SIZE,)
-DEFAULT_LR = 3e-4
-DEFAULT_EPOCHS = 30
-DEFAULT_PATIENCE = 6
-DEFAULT_CLIPNORM = 1.0
-DEFAULT_TVALID_WINDOW = 8        # moving-average window for val RMSE
-FINITE_DIFF_EPS_ABS = 1e-6
 
 
 # ----------------------------------------------------------------------
@@ -109,18 +107,26 @@ def rollout(model: BatteryModel,
             initial_soc: float = None,
             compute_jacobian: bool = False,
             init_state: dict = None,
-            ) -> Tuple[np.ndarray, np.ndarray, int, dict]:
+            ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     """Threaded-state physics rollout.
 
-    Returns (v_pred, jac, n_resets, final_state). If `init_state` is
-    given (a dict with ir1, ir2, z, h, s) the rollout starts from that
-    state -- this is how window k's final state seeds window k+1's
-    initial state, threading state across an entire file even when
-    Adam updates are taken per window.
+    Returns (v_pred, jac, reset_mask, final_state). `reset_mask` is a
+    boolean array of shape (N,) -- True at every timestep where the
+    numerical safety net fired (non-finite voltage, non-finite ir1/ir2,
+    or |v|>10 V). Callers can use it to identify timesteps whose
+    gradients should be discarded so a single bad timestep cannot drag
+    the rest of the window into the wrong direction. `n_resets` is just
+    `reset_mask.sum()`.
+
+    If `init_state` is given (a dict with ir1, ir2, z, h, s) the rollout
+    starts from that state -- this is how window k's final state seeds
+    window k+1's initial state, threading state across an entire file
+    even when Adam updates are taken per window.
     """
     N = len(current_seq)
     v_pred = np.zeros(N, dtype=np.float64)
     jac = np.zeros((N, 8), dtype=np.float64) if compute_jacobian else None
+    reset_mask = np.zeros(N, dtype=bool)
 
     if init_state is not None:
         ir1 = float(init_state["ir1"])
@@ -131,7 +137,6 @@ def rollout(model: BatteryModel,
     else:
         ir1, ir2, h, s = 0.0, 0.0, 0.0, 0.0
         z = float(initial_soc) if initial_soc is not None else 100.0
-    n_resets = 0
 
     for t in range(N):
         p = params_seq[t]
@@ -146,13 +151,13 @@ def rollout(model: BatteryModel,
            (not np.isfinite(ir2_n)) or abs(v) > 10.0:
             v = float(v_meas[t])
             ir1_n, ir2_n = 0.0, 0.0
-            n_resets += 1
+            reset_mask[t] = True
 
         v_pred[t] = v
 
         if compute_jacobian:
             for k in range(8):
-                step = FINITE_DIFF_EPS_ABS + 1e-4 * abs(p[k])
+                step = PINN_FD_EPS_ABS + 1e-4 * abs(p[k])
                 p_plus = p.copy(); p_plus[k] += step
                 p_minus = p.copy(); p_minus[k] -= step
                 v_plus, *_ = model.calculate_voltage(
@@ -173,24 +178,74 @@ def rollout(model: BatteryModel,
         ir1, ir2, z, h, s = ir1_n, ir2_n, z_n, h_n, s_n
 
     final_state = {"ir1": ir1, "ir2": ir2, "z": z, "h": h, "s": s}
-    return v_pred, jac, n_resets, final_state
+    return v_pred, jac, reset_mask, final_state
+
+
+# ----------------------------------------------------------------------
+#  Soft physics-realism penalty
+# ----------------------------------------------------------------------
+def physics_penalty_grad(params: np.ndarray,
+                         lam: float,
+                         tau_min: float,
+                         window_size: int) -> np.ndarray:
+    """Per-timestep gradient of the soft physics-realism penalty.
+
+    For each timestep, the penalty is
+
+        P(p) = relu(-C1) + relu(-C2) + relu(-R0) + relu(-R1) + relu(-R2)
+             + relu(tau_min - R1*C1) + relu(tau_min - R2*C2)
+
+    i.e. the network pays linearly for negative R/C parameters and for
+    RC time constants below `tau_min` (which would otherwise drive
+    `exp(-Ts/tau)` to overflow inside the rollout). This is a SOFT bias
+    in the loss, NOT a clip on the parameters -- C1..M still flow freely
+    in optimization, the penalty just makes the unstable regime more
+    expensive than the stable one.
+
+    Returned shape matches `params`. The result is already scaled to
+    match the per-sample format used by the MSE term (see file_level_train),
+    i.e. it carries the implicit `1/window_size` factor of a mean-over-window
+    loss term so MSE and penalty add cleanly inside `nn.backward`.
+    """
+    if lam <= 0.0:
+        return np.zeros_like(params)
+
+    C1, C2, R0 = params[:, 0], params[:, 1], params[:, 2]
+    R1, R2 = params[:, 3], params[:, 4]
+    g = np.zeros_like(params)
+
+    # negativity penalties: d/dp relu(-p) = -1 when p<0 else 0
+    g[:, 0] += -(C1 < 0.0).astype(np.float64)
+    g[:, 1] += -(C2 < 0.0).astype(np.float64)
+    g[:, 2] += -(R0 < 0.0).astype(np.float64)
+    g[:, 3] += -(R1 < 0.0).astype(np.float64)
+    g[:, 4] += -(R2 < 0.0).astype(np.float64)
+
+    # tau_min penalties: relu(tau_min - R*C). When violated, gradient is
+    # d/dC = -R, d/dR = -C  (ignoring the indicator).
+    bad1 = (R1 * C1 < tau_min)
+    bad2 = (R2 * C2 < tau_min)
+    g[:, 0] += np.where(bad1, -R1, 0.0)   # dP/dC1
+    g[:, 3] += np.where(bad1, -C1, 0.0)   # dP/dR1
+    g[:, 1] += np.where(bad2, -R2, 0.0)   # dP/dC2
+    g[:, 4] += np.where(bad2, -C2, 0.0)   # dP/dR2
+
+    return (lam / float(window_size)) * g
 
 
 # ----------------------------------------------------------------------
 #  Window-level training (Path B)
 # ----------------------------------------------------------------------
-DEFAULT_TRAIN_WINDOW = 256        # samples per gradient update (~0.7 DST cycles)
-DEFAULT_TRAIN_STRIDE = 256        # non-overlapping by default
-
-
 def file_level_train(nn: PinnV2,
                      model: BatteryModel,
                      pack: dict,
                      lr: float,
                      clipnorm: float,
-                     window_size: int = DEFAULT_TRAIN_WINDOW,
-                     stride: int = DEFAULT_TRAIN_STRIDE,
-                     compute_update: bool = True
+                     window_size: int = PINN_TRAIN_WINDOW,
+                     stride: int = PINN_TRAIN_STRIDE,
+                     compute_update: bool = True,
+                     phys_lambda: float = PINN_PHYS_PENALTY_LAMBDA,
+                     phys_tau_min: float = PINN_PHYS_TAU_MIN,
                      ) -> Tuple[float, np.ndarray, int]:
     """Window-based training pass over one BD file.
 
@@ -203,6 +258,20 @@ def file_level_train(nn: PinnV2,
     The final state of each window is the initial state of the next, so
     the physics is continuous across the entire file. Adam fires ~50 times
     per file per epoch (vs once per file in the old file-level path).
+
+    Two stability measures live here (both addressed by the recent
+    "growing reset count" failure mode):
+
+      * Reset-step gradient masking: when the rollout safety net fires at
+        timestep t (replacing v_pred with v_meas), the corresponding row
+        of the jacobian comes from a numerically pathological parameter
+        and is unreliable. We zero out err[t] AND jac[t,:] before
+        forming d_out, so a bad timestep contributes neutral gradient
+        instead of noise.
+
+      * Soft physics-realism penalty (see physics_penalty_grad): adds a
+        gradient pushing R/C/tau back into the stable regime. Off when
+        phys_lambda=0.
     """
     X = pack["X"]
     I = pack["current"]
@@ -224,12 +293,13 @@ def file_level_train(nn: PinnV2,
         Vw = V[start:end]
 
         params_w = nn.forward(Xw, training=compute_update)             # (W, 8)
-        v_pred_w, jac_w, n_resets, state = rollout(
+        v_pred_w, jac_w, reset_mask, state = rollout(
             model, params_w, Iw, Vw,
             initial_soc=initial_soc,
             compute_jacobian=compute_update,
             init_state=state,
         )
+        n_resets = int(reset_mask.sum())
         total_resets += n_resets
 
         err = v_pred_w - Vw
@@ -246,7 +316,19 @@ def file_level_train(nn: PinnV2,
         if compute_update:
             if not np.all(np.isfinite(jac_w)):
                 continue
+
+            # Mask reset-step contributions to the MSE gradient so a
+            # numerically pathological timestep does not dominate the
+            # update. err and jac at those steps both go to zero.
+            if n_resets > 0:
+                err = err.copy()
+                jac_w = jac_w.copy()
+                err[reset_mask] = 0.0
+                jac_w[reset_mask, :] = 0.0
+
             d_out = (2.0 / window_size) * err[:, None] * jac_w
+            d_out += physics_penalty_grad(params_w, phys_lambda,
+                                          phys_tau_min, window_size)
             nn.backward(d_out)
             nn.optimize(lr=lr, clipnorm=clipnorm)
 
@@ -255,8 +337,8 @@ def file_level_train(nn: PinnV2,
 
 
 def evaluate(nn: PinnV2, model: BatteryModel, files: List[dict],
-             window_size: int = DEFAULT_TRAIN_WINDOW,
-             stride: int = DEFAULT_TRAIN_STRIDE) -> float:
+             window_size: int = PINN_TRAIN_WINDOW,
+             stride: int = PINN_TRAIN_STRIDE) -> float:
     rmses = []
     for f in files:
         r, _, _ = file_level_train(nn, model, f, lr=0.0, clipnorm=0.0,
@@ -280,7 +362,7 @@ def dump_inference_csv(nn: PinnV2, model: BatteryModel,
     rows = []
     for f in files:
         params_seq = nn.forward(f["X"], training=False)
-        v_pred, _, _, _ = rollout(
+        v_pred, _jac, _reset_mask, _final_state = rollout(
             model, params_seq, f["current"], f["v_meas"],
             initial_soc=BATTERY_CONFIG["constants"]["initial_soc"],
             compute_jacobian=False,
@@ -309,23 +391,27 @@ def main():
     parser.add_argument("--output",
                         default=os.path.join(MODELS_DIR, "pinn_healthy_no_leak.npz"))
     parser.add_argument("--history-csv",
-                        default=os.path.join(RESULTS_DIR, "train_pinn_v2_history.csv"))
+                        default=os.path.join(RESULTS_DIR, "pinn", "train_history.csv"))
     parser.add_argument("--dump-csv",
-                        default=os.path.join(RESULTS_DIR, "pinn_inference_dump.csv"))
-    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
-    parser.add_argument("--patience", type=int, default=DEFAULT_PATIENCE,
+                        default=os.path.join(RESULTS_DIR, "pinn", "inference_dump.csv"))
+    parser.add_argument("--epochs", type=int, default=PINN_EPOCHS)
+    parser.add_argument("--patience", type=int, default=PINN_PATIENCE,
                         help="Early-stop patience measured on the MOVING AVERAGE "
                              "of val RMSE, ignoring spike epochs.")
-    parser.add_argument("--learning-rate", type=float, default=DEFAULT_LR)
-    parser.add_argument("--clipnorm", type=float, default=DEFAULT_CLIPNORM)
-    parser.add_argument("--val-fraction", type=float, default=0.2)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--learning-rate", type=float, default=PINN_LEARNING_RATE)
+    parser.add_argument("--clipnorm", type=float, default=PINN_CLIPNORM)
+    parser.add_argument("--val-fraction", type=float, default=PINN_VAL_FRACTION)
+    parser.add_argument("--seed", type=int, default=PINN_RANDOM_SEED)
     parser.add_argument("--skip-dump", action="store_true",
                         help="Skip the final per-sample CSV dump")
-    parser.add_argument("--window-size", type=int, default=DEFAULT_TRAIN_WINDOW,
-                        help="Samples per gradient update (Path B). Default 256.")
-    parser.add_argument("--stride", type=int, default=DEFAULT_TRAIN_STRIDE,
-                        help="Window stride. Default 256 (non-overlapping).")
+    parser.add_argument("--window-size", type=int, default=PINN_TRAIN_WINDOW,
+                        help="Samples per gradient update (Path B).")
+    parser.add_argument("--stride", type=int, default=PINN_TRAIN_STRIDE,
+                        help="Window stride.")
+    parser.add_argument("--phys-lambda", type=float, default=PINN_PHYS_PENALTY_LAMBDA,
+                        help="Soft physics-realism penalty weight. 0 disables.")
+    parser.add_argument("--phys-tau-min", type=float, default=PINN_PHYS_TAU_MIN,
+                        help="Minimum stable RC time constant (s) for the penalty.")
     parser.add_argument("--batch-size", type=int, default=None,
                         help="(ignored — window-level training)")
     args = parser.parse_args()
@@ -345,6 +431,13 @@ def main():
     print(f"[train_pinn_healthy] inputs DO NOT include voltage of any kind")
     print(f"[train_pinn_healthy] training: per-window  window={args.window_size}  "
           f"stride={args.stride}  (state threads file-wide; Adam updates per window)")
+    print(f"[train_pinn_healthy] optim:    lr={args.learning_rate}  "
+          f"clipnorm={args.clipnorm}  patience={args.patience}  epochs={args.epochs}")
+    if args.phys_lambda > 0.0:
+        print(f"[train_pinn_healthy] phys penalty: lambda={args.phys_lambda}  "
+              f"tau_min={args.phys_tau_min}s  (negative R/C and tau<tau_min discouraged)")
+    else:
+        print(f"[train_pinn_healthy] phys penalty: DISABLED (lambda=0)")
 
     files_all = load_all_bd_files(args.dataset_root, args.charge_rate,
                                   args.discharge_mode)
@@ -395,6 +488,7 @@ def main():
                 nn, model, f, lr=args.learning_rate, clipnorm=args.clipnorm,
                 window_size=args.window_size, stride=args.stride,
                 compute_update=True,
+                phys_lambda=args.phys_lambda, phys_tau_min=args.phys_tau_min,
             )
             resets_epoch += n_resets
             if np.isfinite(rmse):
@@ -405,7 +499,7 @@ def main():
                             window_size=args.window_size, stride=args.stride)
         val_history.append(val_rmse)
 
-        window = val_history[-DEFAULT_TVALID_WINDOW:]
+        window = val_history[-PINN_VAL_MA_WINDOW:]
         finite_window = [x for x in window if np.isfinite(x)]
         val_movavg = float(np.mean(finite_window)) if finite_window else float("inf")
 

@@ -23,9 +23,10 @@ def _channel_image(signal: np.ndarray,
                    scales: np.ndarray,
                    img_size: Tuple[int, int] = (224, 224),
                    pct_lo: float = 1.0,
-                   pct_hi: float = 99.0) -> np.ndarray:
+                   pct_hi: float = 99.0,
+                   detrend: str = "cubic") -> np.ndarray:
     """Scalogram → 224×224 float32 image for a single 1-D window."""
-    sc, _ = raw_log_scalogram(signal, fs, scales)
+    sc, _ = raw_log_scalogram(signal, fs, scales, detrend=detrend)
     valid = sc[~np.isnan(sc)]
     if valid.size:
         vmin = float(np.percentile(valid, pct_lo))
@@ -43,6 +44,19 @@ def build_three_scalogram_image(v_meas_win: np.ndarray,
     """Stack the three scalogram channels into HxWx3 float32.
 
     Channel order: [V_meas, V_pred, residual = V_meas - V_pred].
+
+    Per-channel preprocessing
+    -------------------------
+    V_meas, V_pred : cubic detrend + z-score. The ~1 V NCM811 OCV envelope
+                     across the window would otherwise saturate the lowest
+                     scales of the scalogram and crowd out the fast features.
+    residual       : MEAN-subtract + z-score (no polynomial detrend). The
+                     ISC fault signature is precisely the slow drift of the
+                     residual versus SOC -- a cubic fit absorbs that drift
+                     and deletes the diagnostic, which is what was killing
+                     BD-vs-CS classification (and the SOC-from-V_pred
+                     sanity check, by the same mechanism). See
+                     `preprocess_window` in src/wavelet/image_utils.py.
     """
     v_meas_win = np.asarray(v_meas_win, dtype=np.float64)
     v_pred_win = np.asarray(v_pred_win, dtype=np.float64)
@@ -51,9 +65,12 @@ def build_three_scalogram_image(v_meas_win: np.ndarray,
 
     e_win = v_meas_win - v_pred_win
 
-    img_m = _channel_image(v_meas_win, fs, scales, img_size=img_size)
-    img_p = _channel_image(v_pred_win, fs, scales, img_size=img_size)
-    img_e = _channel_image(e_win, fs, scales, img_size=img_size)
+    img_m = _channel_image(v_meas_win, fs, scales, img_size=img_size,
+                           detrend="cubic")
+    img_p = _channel_image(v_pred_win, fs, scales, img_size=img_size,
+                           detrend="cubic")
+    img_e = _channel_image(e_win,      fs, scales, img_size=img_size,
+                           detrend="mean")
 
     stack = np.stack([img_m, img_p, img_e], axis=-1).astype(np.float32)
     return stack

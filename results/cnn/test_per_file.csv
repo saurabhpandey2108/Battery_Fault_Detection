@@ -1,0 +1,5 @@
+file,class,ohm,true_label,n_windows,mean_prob,max_prob,verdict,correct
+ISC_BD_0.5CC_DST_20ohm.csv,BD,20,0,46,0.497518,0.498448,0,1
+ISC_BD_0.5CC_DST_500ohm.csv,BD,500,0,47,0.497389,0.498512,0,1
+ISC_CS_0.5CC_DST_1000ohm.csv,CS,1000,1,46,0.497555,0.498938,0,0
+ISC_CS_0.5CC_DST_600ohm.csv,CS,600,1,46,0.497226,0.498117,0,0

@@ -28,6 +28,13 @@ from src.config import SCALES, WINDOW_SIZE, MODELS_DIR, RESULTS_DIR
 from src.data.tsinghua_loader import load_tsinghua_csv, parse_filename
 from src.inference.infer_pinn import load_pinn, predict_voltage_series
 from src.wavelet.image_utils import raw_log_scalogram
+from src.wavelet.scalogram_metrics import (
+    pairwise_scalogram_metrics,
+    append_metrics_row,
+)
+
+
+SIMILARITY_CSV = os.path.join(RESULTS_DIR, "three_scalograms", "similarity.csv")
 
 
 def _select_window(pred: dict, window_size: int, start: int) -> dict:
@@ -45,10 +52,15 @@ def _select_window(pred: dict, window_size: int, start: int) -> dict:
     }
 
 
-def _scalogram(signal: np.ndarray, fs: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Run the same Wavelet_Analysis path as training (cubic-detrend + z-score,
-    Morlet CWT, COI mask to NaN). Returns (dB scalogram, freqs, coi-boundary freq)."""
-    sc, freqs = raw_log_scalogram(signal, fs, SCALES)
+def _scalogram(signal: np.ndarray, fs: float,
+               detrend: str = "cubic") -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Run the same Wavelet_Analysis path as training, with per-channel
+    detrend choice. Returns (dB scalogram, freqs, coi-boundary freq).
+
+    Use detrend='cubic' for V_meas / V_pred and detrend='mean' for the
+    residual (the ISC fault drift is what we want to keep in the scalogram).
+    """
+    sc, freqs = raw_log_scalogram(signal, fs, SCALES, detrend=detrend)
     order = np.argsort(freqs)
     sc_sorted = sc[order]
     f_sorted = freqs[order]
@@ -114,14 +126,28 @@ def compare_bd_cs(bd_file: str,
     cs_w = _select_window(cs_pred, window_size, start_sample)
     fs = 1.0
 
-    # Scalograms on each channel for each file
-    bd_sc_m, f, coi = _scalogram(bd_w["v_meas"], fs)
-    bd_sc_p, _, _ = _scalogram(bd_w["v_pred"], fs)
-    bd_sc_r, _, _ = _scalogram(bd_w["residual"], fs)
+    # Scalograms on each channel for each file. Per-channel detrend choice
+    # matches train_classifier's three_scalogram_builder so figures show
+    # what the CNN actually sees.
+    bd_sc_m, f, coi = _scalogram(bd_w["v_meas"],   fs, detrend="cubic")
+    bd_sc_p, _, _   = _scalogram(bd_w["v_pred"],   fs, detrend="cubic")
+    bd_sc_r, _, _   = _scalogram(bd_w["residual"], fs, detrend="mean")
 
-    cs_sc_m, _, _ = _scalogram(cs_w["v_meas"], fs)
-    cs_sc_p, _, _ = _scalogram(cs_w["v_pred"], fs)
-    cs_sc_r, _, _ = _scalogram(cs_w["residual"], fs)
+    cs_sc_m, _, _ = _scalogram(cs_w["v_meas"],   fs, detrend="cubic")
+    cs_sc_p, _, _ = _scalogram(cs_w["v_pred"],   fs, detrend="cubic")
+    cs_sc_r, _, _ = _scalogram(cs_w["residual"], fs, detrend="mean")
+
+    # Pairwise similarity between the three channels of the scalogram stack.
+    # Diagnostic expectations:
+    #   meas-vs-pred  : HIGH on BD (PINN tracks V_meas), LOWER on CS.
+    #   meas-vs-resid : LOW  on BD (residual is noise), HIGHER on CS
+    #                   (residual inherits V_meas structure as V_pred drifts).
+    bd_metrics = pairwise_scalogram_metrics(bd_sc_m, bd_sc_p, bd_sc_r)
+    cs_metrics = pairwise_scalogram_metrics(cs_sc_m, cs_sc_p, cs_sc_r)
+    delta_ssim = bd_metrics["ssim_meas_pred"] - cs_metrics["ssim_meas_pred"]
+    delta_pcc = bd_metrics["r_meas_pred"] - cs_metrics["r_meas_pred"]
+    delta_ssim_resid = cs_metrics["ssim_meas_resid"] - bd_metrics["ssim_meas_resid"]
+    delta_pcc_resid = cs_metrics["r_meas_resid"] - bd_metrics["r_meas_resid"]
 
     # Shared per-channel dB ranges so BD and CS are directly comparable
     vmin_m, vmax_m = _shared_range(bd_sc_m, cs_sc_m)
@@ -133,9 +159,9 @@ def compare_bd_cs(bd_file: str,
 
     fig, axes = plt.subplots(2, 4, figsize=(22, 10))
 
-    for row, (label, w, sc_m, sc_p, sc_r, meta) in enumerate([
-        ("BD (healthy)", bd_w, bd_sc_m, bd_sc_p, bd_sc_r, bd_meta),
-        (f"CS ({cs_meta['ohm']} ohm ISC)", cs_w, cs_sc_m, cs_sc_p, cs_sc_r, cs_meta),
+    for row, (label, w, sc_m, sc_p, sc_r, meta, m) in enumerate([
+        ("BD (healthy)", bd_w, bd_sc_m, bd_sc_p, bd_sc_r, bd_meta, bd_metrics),
+        (f"CS ({cs_meta['ohm']} ohm ISC)", cs_w, cs_sc_m, cs_sc_p, cs_sc_r, cs_meta, cs_metrics),
     ]):
         # Column 0: time-domain signals
         ax0 = axes[row, 0]
@@ -153,13 +179,23 @@ def compare_bd_cs(bd_file: str,
         rms = float(np.sqrt(np.mean(w["residual"]**2)))
         ax0.set_title(f"{label}  —  RMS residual = {rms:.4f} V", fontsize=10)
 
-        # Columns 1..3: V_meas / V_pred / residual scalograms
+        # Columns 1..3: V_meas / V_pred / residual scalograms.
+        # SSIM and Pearson r are reported on each channel where they carry
+        # diagnostic meaning:
+        #   V_pred panel    -> meas vs pred (drops on CS)
+        #   residual panel  -> meas vs resid (rises on CS)
         m1 = _draw_scalogram(axes[row, 1], sc_m, f, coi, w["t"],
                              vmin_m, vmax_m, f"{label} — V_meas scalogram")
-        m2 = _draw_scalogram(axes[row, 2], sc_p, f, coi, w["t"],
-                             vmin_p, vmax_p, f"{label} — V_pred scalogram")
-        m3 = _draw_scalogram(axes[row, 3], sc_r, f, coi, w["t"],
-                             vmin_r, vmax_r, f"{label} — residual scalogram")
+        m2 = _draw_scalogram(
+            axes[row, 2], sc_p, f, coi, w["t"], vmin_p, vmax_p,
+            f"{label} — V_pred scalogram\n"
+            f"SSIM(meas,pred)={m['ssim_meas_pred']:.3f}   "
+            f"r={m['r_meas_pred']:.3f}")
+        m3 = _draw_scalogram(
+            axes[row, 3], sc_r, f, coi, w["t"], vmin_r, vmax_r,
+            f"{label} — residual scalogram\n"
+            f"SSIM(meas,resid)={m['ssim_meas_resid']:.3f}   "
+            f"r={m['r_meas_resid']:.3f}")
 
         if row == 0:
             fig.colorbar(m1, ax=axes[:, 1].tolist(), label="dB magnitude", fraction=0.03, pad=0.02)
@@ -168,12 +204,34 @@ def compare_bd_cs(bd_file: str,
 
     fig.suptitle(
         f"Three-Scalogram BD vs CS comparison  —  "
-        f"{bd_meta['charge_rate']}C {bd_meta['discharge_mode']}, {cs_meta['ohm']} ohm ISC",
-        fontsize=13, y=0.995,
+        f"{bd_meta['charge_rate']}C {bd_meta['discharge_mode']}, {cs_meta['ohm']} ohm ISC\n"
+        f"meas-vs-pred  ΔSSIM = {delta_ssim:+.3f}  Δr = {delta_pcc:+.3f}     "
+        f"meas-vs-resid  ΔSSIM = {delta_ssim_resid:+.3f}  Δr = {delta_pcc_resid:+.3f}",
+        fontsize=12, y=0.995,
     )
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     fig.savefig(out_path, dpi=130, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved comparison figure -> {out_path}")
+
+    # Persist both rows to results/scalogram_similarity.csv so the numbers
+    # are auditable without re-running the figure render.
+    for path, class_, meta, metrics in [
+        (bd_file, "BD", bd_meta, bd_metrics),
+        (cs_file, "CS", cs_meta, cs_metrics),
+    ]:
+        append_metrics_row(
+            SIMILARITY_CSV,
+            source="compare_bd_cs",
+            file=os.path.basename(path),
+            class_=class_,
+            ohm=meta.get("ohm"),
+            charge_rate=meta.get("charge_rate"),
+            discharge_mode=meta.get("discharge_mode"),
+            window_size=window_size,
+            start_sample=start_sample,
+            metrics=metrics,
+        )
+    print(f"Appended similarity rows -> {SIMILARITY_CSV}")
     return out_path

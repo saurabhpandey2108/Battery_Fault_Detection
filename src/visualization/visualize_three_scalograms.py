@@ -28,7 +28,15 @@ if _PROJECT_ROOT not in sys.path:
 from src.config import MODELS_DIR, RESULTS_DIR, SCALES, WINDOW_SIZE
 from src.data.tsinghua_loader import load_tsinghua_csv, parse_filename
 from src.inference.infer_pinn import predict_voltage_series
+from src.wavelet.image_utils import raw_log_scalogram
 from src.wavelet.plot_utils import plot_frequency_scalogram
+from src.wavelet.scalogram_metrics import (
+    pairwise_scalogram_metrics,
+    append_metrics_row,
+)
+
+
+SIMILARITY_CSV = os.path.join(RESULTS_DIR, "three_scalograms", "similarity.csv")
 
 
 def visualize_file(filepath: str,
@@ -92,15 +100,34 @@ def visualize_file(filepath: str,
     ax_e = fig.add_subplot(gs[1, 2])
 
     plot_frequency_scalogram(v_meas, fs, None, save_path=None,
-                             title_suffix="— V_meas", ax=ax_m)
+                             title_suffix="— V_meas", ax=ax_m,
+                             detrend="cubic")
     plot_frequency_scalogram(v_pred, fs, None, save_path=None,
-                             title_suffix="— V_pred", ax=ax_p)
+                             title_suffix="— V_pred", ax=ax_p,
+                             detrend="cubic")
     plot_frequency_scalogram(residual, fs, None, save_path=None,
-                             title_suffix="— residual e(t)", ax=ax_e)
+                             title_suffix="— residual e(t)", ax=ax_e,
+                             detrend="mean")
 
-    fig.suptitle(f"Three-Scalogram Diagnostic — {os.path.basename(filepath)}",
-                 fontsize=14, y=0.995)
-    fig.tight_layout(rect=[0, 0, 1, 0.98])
+    # Pairwise SSIM and Pearson r on the dB-magnitude scalograms with the
+    # SAME per-channel detrend the CNN sees (cubic for meas/pred, mean for
+    # residual -- preserves the slow drift that carries the ISC signature).
+    sc_meas,  _ = raw_log_scalogram(v_meas,   fs, SCALES, detrend="cubic")
+    sc_pred,  _ = raw_log_scalogram(v_pred,   fs, SCALES, detrend="cubic")
+    sc_resid, _ = raw_log_scalogram(residual, fs, SCALES, detrend="mean")
+    metrics = pairwise_scalogram_metrics(sc_meas, sc_pred, sc_resid)
+
+    fig.suptitle(
+        f"Three-Scalogram Diagnostic — {os.path.basename(filepath)}\n"
+        f"SSIM(meas,pred)={metrics['ssim_meas_pred']:.3f}  "
+        f"r={metrics['r_meas_pred']:.3f}     "
+        f"SSIM(meas,resid)={metrics['ssim_meas_resid']:.3f}  "
+        f"r={metrics['r_meas_resid']:.3f}     "
+        f"SSIM(pred,resid)={metrics['ssim_pred_resid']:.3f}  "
+        f"r={metrics['r_pred_resid']:.3f}",
+        fontsize=12, y=0.995,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
 
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir,
@@ -108,13 +135,27 @@ def visualize_file(filepath: str,
     fig.savefig(out_path, dpi=140)
     plt.close(fig)
     print(f"Saved -> {out_path}")
+
+    append_metrics_row(
+        SIMILARITY_CSV,
+        source="visualize_three_scalograms",
+        file=os.path.basename(filepath),
+        class_=meta.get("class_", ""),
+        ohm=meta.get("ohm"),
+        charge_rate=meta.get("charge_rate"),
+        discharge_mode=meta.get("discharge_mode"),
+        window_size=window_size,
+        start_sample=start,
+        metrics=metrics,
+    )
+    print(f"Appended similarity row -> {SIMILARITY_CSV}")
     return out_path
 
 
 def main():
     parser = argparse.ArgumentParser(description="Render a 2×2 three-scalogram figure for one CSV")
     parser.add_argument("file", help="Path to a Tsinghua CSV")
-    parser.add_argument("--pinn-weights", default=os.path.join(MODELS_DIR, "pinn_healthy.npz"))
+    parser.add_argument("--pinn-weights", default=os.path.join(MODELS_DIR, "pinn_healthy_no_leak.npz"))
     parser.add_argument("--out-dir", default=os.path.join(RESULTS_DIR, "three_scalograms"))
     parser.add_argument("--window-size", type=int, default=WINDOW_SIZE)
     parser.add_argument("--start-sample", type=int, default=0)
