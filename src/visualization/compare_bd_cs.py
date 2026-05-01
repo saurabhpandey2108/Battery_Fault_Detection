@@ -10,8 +10,13 @@ To make brightness directly comparable between BD and CS, each channel's
 percentile range (vmin, vmax) is computed on the COMBINED dB distribution
 from both files — so a residual that is pure noise in BD and structured
 in CS renders at visibly different intensities on the same colormap.
-The per-window cubic-detrend + z-score preprocessing inside
-`raw_log_scalogram` and the COI mask are untouched (hard constraints).
+
+Per-channel preprocessing (matches `build_three_scalogram_image`):
+  V_meas, V_pred  → cubic detrend + z-score (the ~1 V OCV envelope must
+                    be removed or it saturates the lowest scales).
+  residual        → mean-subtract + z-score (the slow drift IS the ISC
+                    diagnostic; cubic detrend would absorb it).
+The COI mask is untouched (hard constraint).
 """
 
 from __future__ import annotations
@@ -149,10 +154,15 @@ def compare_bd_cs(bd_file: str,
     delta_ssim_resid = cs_metrics["ssim_meas_resid"] - bd_metrics["ssim_meas_resid"]
     delta_pcc_resid = cs_metrics["r_meas_resid"] - bd_metrics["r_meas_resid"]
 
-    # Shared per-channel dB ranges so BD and CS are directly comparable
-    vmin_m, vmax_m = _shared_range(bd_sc_m, cs_sc_m)
-    vmin_p, vmax_p = _shared_range(bd_sc_p, cs_sc_p)
-    vmin_r, vmax_r = _shared_range(bd_sc_r, cs_sc_r)
+    # Shared per-channel dB ranges so BD and CS are directly comparable.
+    # Residual gets a tighter percentile (10-90) because the BD vs CS gap on
+    # the residual is small in dB terms (per-window drift ~18 mV against
+    # oscillation std ~23 mV); the wider 1-99 range washes the gap out
+    # toward the bottom of the colormap. V_meas / V_pred keep 1-99 since
+    # their dynamic range is dominated by DST current pulses.
+    vmin_m, vmax_m = _shared_range(bd_sc_m, cs_sc_m, pct_lo=1.0,  pct_hi=99.0)
+    vmin_p, vmax_p = _shared_range(bd_sc_p, cs_sc_p, pct_lo=1.0,  pct_hi=99.0)
+    vmin_r, vmax_r = _shared_range(bd_sc_r, cs_sc_r, pct_lo=10.0, pct_hi=90.0)
 
     bd_meta = parse_filename(bd_file)
     cs_meta = parse_filename(cs_file)
@@ -234,4 +244,135 @@ def compare_bd_cs(bd_file: str,
             metrics=metrics,
         )
     print(f"Appended similarity rows -> {SIMILARITY_CSV}")
+    return out_path
+
+
+# ----------------------------------------------------------------------
+#  Hero figure (report / slide layout)
+# ----------------------------------------------------------------------
+def compare_bd_cs_hero(bd_file: str,
+                       cs_file: str,
+                       pinn_weights: str,
+                       out_path: str,
+                       window_size: int = WINDOW_SIZE,
+                       start_sample: int = 0,
+                       sampling_time: Optional[float] = None,
+                       capacity_as: Optional[float] = None) -> str:
+    """Three-column "hero" comparison built for a report or slide.
+
+    Layout (2 rows x 3 cols):
+        col 1 -- V_meas (orange) and V_pred (green dashed) overlaid in time
+        col 2 -- residual e(t) = V_meas - V_pred in time, with smooth mean
+        col 3 -- residual scalogram (mean-detrended), shared dB range so
+                 BD and CS are directly comparable on the same colormap
+
+    The point of this figure is to make a single visual claim: the residual
+    on BD is small and oscillation-dominated, while the residual on CS shows
+    the slow ISC drift that re-emerges in the low-frequency band of the
+    scalogram. No V_meas / V_pred standalone scalograms (that's what the
+    diagnostic 2x4 figure is for); this is the "what does the diagnostic
+    actually look like?" version.
+    """
+    nn = load_pinn(pinn_weights)
+
+    bd_pred = predict_voltage_series(nn, load_tsinghua_csv(bd_file)["discharge_df"],
+                                     sampling_time=sampling_time, capacity_as=capacity_as)
+    cs_pred = predict_voltage_series(nn, load_tsinghua_csv(cs_file)["discharge_df"],
+                                     sampling_time=sampling_time, capacity_as=capacity_as)
+
+    bd_w = _select_window(bd_pred, window_size, start_sample)
+    cs_w = _select_window(cs_pred, window_size, start_sample)
+    fs = 1.0
+
+    # Residual scalogram only (mean detrend -- preserves the slow ISC drift).
+    bd_sc_r, f, coi = _scalogram(bd_w["residual"], fs, detrend="mean")
+    cs_sc_r, _, _   = _scalogram(cs_w["residual"], fs, detrend="mean")
+
+    # Tight residual dB range (10-90 percentile) so the BD/CS contrast reads
+    # at slide size; the 1-99 default washes the small dB gap to the bottom
+    # of the colormap.
+    vmin_r, vmax_r = _shared_range(bd_sc_r, cs_sc_r, pct_lo=10.0, pct_hi=90.0)
+
+    bd_meta = parse_filename(bd_file)
+    cs_meta = parse_filename(cs_file)
+
+    fig, axes = plt.subplots(2, 3, figsize=(16, 8.5),
+                             gridspec_kw={"width_ratios": [1.1, 1.1, 1.4]})
+
+    last_mesh = None
+    for row, (label, color, w, sc_r, meta) in enumerate([
+        ("BD healthy",                "#1b9e77", bd_w, bd_sc_r, bd_meta),
+        (f"CS {cs_meta['ohm']} Ω ISC", "#d95f02", cs_w, cs_sc_r, cs_meta),
+    ]):
+        # Col 1 -- voltage overlay
+        ax_v = axes[row, 0]
+        ax_v.plot(w["t"], w["v_meas"], color="#d95f02", linewidth=1.6, label="V_meas")
+        ax_v.plot(w["t"], w["v_pred"], color="#1b9e77", linewidth=1.4,
+                  linestyle="--", label="V_pred (PINN)")
+        ax_v.set_xlabel("Time (s)", fontsize=11)
+        ax_v.set_ylabel("Voltage (V)", fontsize=11)
+        ax_v.grid(True, alpha=0.3)
+        ax_v.legend(loc="upper right", fontsize=10, framealpha=0.9)
+        ax_v.set_title(f"{label}\nVoltage trace ({window_size}-sample window)",
+                       fontsize=12, color=color, fontweight="bold")
+        ax_v.tick_params(labelsize=10)
+
+        # Col 2 -- residual time series
+        ax_r = axes[row, 1]
+        residual_mv = w["residual"] * 1000.0
+        smooth = np.convolve(residual_mv, np.ones(60) / 60.0, mode="same")
+        ax_r.plot(w["t"], residual_mv, color="#e7298a", linewidth=0.8,
+                  alpha=0.55, label="raw")
+        ax_r.plot(w["t"], smooth, color="black", linewidth=1.6,
+                  label="60-s mean")
+        ax_r.axhline(0.0, color="black", linewidth=0.6, alpha=0.5)
+        rms_mv = float(np.sqrt(np.mean(residual_mv ** 2)))
+        mean_mv = float(np.mean(residual_mv))
+        ax_r.set_xlabel("Time (s)", fontsize=11)
+        ax_r.set_ylabel("Residual e(t) (mV)", fontsize=11)
+        ax_r.grid(True, alpha=0.3)
+        ax_r.legend(loc="upper right", fontsize=10, framealpha=0.9)
+        ax_r.set_title(f"Residual e(t) = V_meas − V_pred\n"
+                       f"RMS = {rms_mv:.1f} mV    mean = {mean_mv:+.1f} mV",
+                       fontsize=12, color=color, fontweight="bold")
+        ax_r.tick_params(labelsize=10)
+
+        # Col 3 -- residual scalogram
+        ax_sc = axes[row, 2]
+        last_mesh = _draw_scalogram(
+            ax_sc, sc_r, f, coi, w["t"], vmin_r, vmax_r,
+            f"{label}  —  residual scalogram\n(mean-detrend; shared dB range)")
+        ax_sc.title.set_color(color)
+        ax_sc.title.set_fontweight("bold")
+        ax_sc.title.set_fontsize(12)
+        ax_sc.tick_params(labelsize=10)
+
+    fig.suptitle(
+        f"ISC fault diagnostic — Tsinghua NCM811 {bd_meta['charge_rate']}C "
+        f"{bd_meta['discharge_mode']}   |   BD healthy vs CS "
+        f"{cs_meta['ohm']} Ω severe ISC",
+        fontsize=14, fontweight="bold", y=0.995,
+    )
+    fig.text(
+        0.5, 0.012,
+        "Reading: BD residual oscillates around zero (oscillations only); "
+        "CS residual drifts negative as SOC drains and that slow drift renders "
+        "as low-frequency energy in the residual scalogram — the diagnostic feature.",
+        ha="center", fontsize=10, color="#444",
+    )
+
+    # tight_layout first, leaving room on the right for a manual colorbar.
+    # Reserving space via the `rect` parameter avoids the "Axes not compatible
+    # with tight_layout" warning that fires when fig.colorbar(ax=axes[:,2])
+    # injects a row-spanning colorbar into the layout.
+    fig.tight_layout(rect=[0, 0.035, 0.92, 0.965])
+    if last_mesh is not None:
+        cax = fig.add_axes([0.93, 0.12, 0.012, 0.78])  # [left, bottom, w, h]
+        fig.colorbar(last_mesh, cax=cax,
+                     label="dB magnitude (residual scalogram)")
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved hero figure -> {out_path}")
     return out_path

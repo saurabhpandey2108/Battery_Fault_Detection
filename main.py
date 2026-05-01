@@ -80,7 +80,7 @@ def _cmd_infer(args):
 
 
 def _cmd_compare(args):
-    from src.visualization.compare_bd_cs import compare_bd_cs
+    from src.visualization.compare_bd_cs import compare_bd_cs, compare_bd_cs_hero
     from src.data.tsinghua_loader import list_phase1_pairs
 
     pairs = list_phase1_pairs(args.dataset_root,
@@ -92,15 +92,20 @@ def _cmd_compare(args):
             f"No BD/CS pair at {args.ohm} ohm for {args.charge_rate}C / {args.discharge_mode}"
         )
     bd, cs, ohm = pairs[0]
-    out = os.path.join(args.out_dir, f"bd_vs_cs_{ohm}ohm.png")
-    compare_bd_cs(
-        bd_file=bd,
-        cs_file=cs,
-        pinn_weights=args.pinn_weights,
-        out_path=out,
-        window_size=args.window_size,
-        start_sample=args.start_sample,
-    )
+    if args.style == "hero":
+        out = os.path.join(args.out_dir, f"hero_bd_vs_cs_{ohm}ohm.png")
+        compare_bd_cs_hero(
+            bd_file=bd, cs_file=cs,
+            pinn_weights=args.pinn_weights, out_path=out,
+            window_size=args.window_size, start_sample=args.start_sample,
+        )
+    else:
+        out = os.path.join(args.out_dir, f"bd_vs_cs_{ohm}ohm.png")
+        compare_bd_cs(
+            bd_file=bd, cs_file=cs,
+            pinn_weights=args.pinn_weights, out_path=out,
+            window_size=args.window_size, start_sample=args.start_sample,
+        )
 
 
 def _cmd_scalogram_similarity(args):
@@ -194,6 +199,10 @@ def build_parser():
     p_cmp.add_argument("--out-dir", default=os.path.join(RESULTS_DIR, "three_scalograms"))
     p_cmp.add_argument("--window-size", type=int, default=WINDOW_SIZE)
     p_cmp.add_argument("--start-sample", type=int, default=0)
+    p_cmp.add_argument("--style", choices=["full", "hero"], default="full",
+                       help="`full` -> 2x4 diagnostic figure (default); "
+                            "`hero` -> 2x3 report/slide layout focused on "
+                            "the residual story")
     p_cmp.set_defaults(func=_cmd_compare)
 
     p_ss = sub.add_parser("scalogram-similarity",

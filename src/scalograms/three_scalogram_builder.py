@@ -2,10 +2,16 @@
 Build (224, 224, 3) scalogram stacks from V_meas, V_pred, and the residual
 e(t) = V_meas - V_pred.
 
-Channel order is [meas, pred, residual]. Each channel runs through exactly
-the same cubic-detrend + z-score + CWT + COI-mask path the Wavelet_Analysis
-project implements (raw_log_scalogram), then gets percentile-range
-normalized to [0, 1] and bilinearly resized to 224×224.
+Channel order is [meas, pred, residual]. Each channel runs through the
+same CWT + COI-mask + percentile-normalize + 224x224 resize path, but
+with PER-CHANNEL detrend choice:
+
+    V_meas, V_pred -> cubic detrend + z-score
+    residual       -> mean-subtract + z-score (no polynomial detrend)
+
+Cubic detrend on the residual would absorb the slow ISC drift (the actual
+fault diagnostic). See `build_three_scalogram_image` for the rationale,
+and `preprocess_window` in src/wavelet/image_utils.py for the modes.
 """
 
 from __future__ import annotations
